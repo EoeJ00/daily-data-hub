@@ -786,7 +786,8 @@ function renderScenario2ConfigModern() {
 }
 
 function renderShelfRunDetails(run) {
-  return `<div class="table-wrap"><table><thead><tr><th>投手</th><th>架上包来源</th><th>投手消耗表</th><th>指标</th><th>汇总值</th><th>结果</th><th>说明</th></tr></thead><tbody>${(run.results || []).flatMap((result) => result.rows?.length ? result.rows.map((row) => `<tr data-run-detail="${escapeHtml(run.id)}"><td><strong>${escapeHtml(row.displayShooter || row.shooter || "—")}</strong></td><td>${escapeHtml((row.packageDetails || []).map((item) => item.packageName).filter(Boolean).join("、") || result.sourceName || "—")}</td><td>${escapeHtml(row.targetSheet || "—")}</td><td>${escapeHtml(row.metric || "—")}</td><td>${formatNumber(row.sourceValue)}</td><td>${badge(row.status)}</td><td>${escapeHtml(row.message || row.range || "—")}</td></tr>`) : [`<tr data-run-detail="${escapeHtml(run.id)}"><td>${escapeHtml(result.sourceName || "架上包工作簿")}</td><td colspan="5">${badge("error")}</td><td>${escapeHtml(result.error || "未知错误")}</td></tr>`]).join("")}</tbody></table></div>`;
+  const targetBadge = (target, sheetName) => target ? `${escapeHtml(sheetName || "—")} ${badge(target.status)}` : "—";
+  return `<div class="table-wrap"><table><thead><tr><th>投手</th><th>架上包来源</th><th>投手消耗表</th><th>总表</th><th>指标</th><th>汇总值</th><th>结果</th><th>说明</th></tr></thead><tbody>${(run.results || []).flatMap((result) => result.rows?.length ? result.rows.map((row) => `<tr data-run-detail="${escapeHtml(run.id)}"><td><strong>${escapeHtml(row.displayShooter || row.shooter || "—")}</strong></td><td>${escapeHtml((row.packageDetails || []).map((item) => item.packageName).filter(Boolean).join("、") || result.sourceName || "—")}</td><td>${targetBadge(row.detail || (row.targetSheet ? { status: row.status } : null), row.targetSheet)}</td><td>${row.total ? `${escapeHtml(row.totalSheet || "总表")} ${badge(row.total.status)}` : "—"}</td><td>${escapeHtml(row.metric || "—")}</td><td>${formatNumber(row.sourceValue)}</td><td>${badge(row.status)}</td><td>${escapeHtml(row.message || row.range || "—")}</td></tr>`) : [`<tr data-run-detail="${escapeHtml(run.id)}"><td>${escapeHtml(result.sourceName || "架上包工作簿")}</td><td colspan="6">${badge("error")}</td><td>${escapeHtml(result.error || "未知错误")}</td></tr>`]).join("")}</tbody></table></div>`;
 }
 
 function renderScenario3Overview() {
@@ -802,7 +803,7 @@ function renderScenario3Overview() {
     </div>
     <section class="panel">
       <div class="panel-header"><div><h2>最近一次架上包搬运结果</h2><p>${latest ? `${latest.businessDate} · ${latest.type === "run" ? "正式写入" : "预览"}` : "尚未执行任务"}</p></div>${latest ? `<span class="badge neutral">${new Date(latest.createdAt).toLocaleString("zh-CN")}</span>` : ""}</div>
-      ${latest ? renderShelfRunDetails(latest) : `<div class="empty-state">${icons.sheet}<h3>等待首次预览</h3><p>系统会自动识别架上包记录表和投手消耗表，再按投手汇总消耗与回流消耗。</p></div>`}
+      ${latest ? renderShelfRunDetails(latest) : `<div class="empty-state">${icons.sheet}<h3>等待首次预览</h3><p>系统会自动识别架上包记录表、投手消耗表和总表，再按投手汇总消耗与回流消耗。</p></div>`}
     </section>`;
   content.querySelectorAll("[data-run-detail]").forEach((row) => row.addEventListener("click", () => { const run = shelf.runs.find((item) => item.id === row.dataset.runDetail); if (run) openRunDetail("scenario-3", run); }));
 }
@@ -814,7 +815,7 @@ function renderShelfBookCards(books) {
 
 function renderScenario3Config() {
   const shelf = scenarioData("scenario-3");
-  const drawerMarkup = `<dialog id="shelfBookDrawer" class="detail-drawer-dialog config-drawer" aria-labelledby="shelfBookTitle"><div class="detail-drawer-card"><button class="detail-close" type="button" data-close-shelf-book aria-label="关闭添加架上包工作簿">×</button><div class="detail-kicker">架上包</div><h2 id="shelfBookTitle">添加架上包工作簿</h2><p>系统会自动区分架上包记录表和投手消耗表，目标写回同一工作簿内对应投手页签。</p><div class="drawer-form"><label>工作簿名<input id="shelfBookName" placeholder="例如：架上包数据表"></label><label>Google 表格链接<input id="shelfBookUrl" placeholder="https://docs.google.com/spreadsheets/d/..."></label><div class="drawer-actions"><button class="button secondary" type="button" data-close-shelf-book>取消</button><button class="button primary" id="addShelfBookButton" type="button">${icons.sheet}添加工作簿</button></div></div></div></dialog>`;
+  const drawerMarkup = `<dialog id="shelfBookDrawer" class="detail-drawer-dialog config-drawer" aria-labelledby="shelfBookTitle"><div class="detail-drawer-card"><button class="detail-close" type="button" data-close-shelf-book aria-label="关闭添加架上包工作簿">×</button><div class="detail-kicker">架上包</div><h2 id="shelfBookTitle">添加架上包工作簿</h2><p>系统会自动区分架上包记录表、投手消耗表和总表，汇总后写回对应投手页签及总表列。</p><div class="drawer-form"><label>工作簿名<input id="shelfBookName" placeholder="例如：架上包数据表"></label><label>Google 表格链接<input id="shelfBookUrl" placeholder="https://docs.google.com/spreadsheets/d/..."></label><div class="drawer-actions"><button class="button secondary" type="button" data-close-shelf-book>取消</button><button class="button primary" id="addShelfBookButton" type="button">${icons.sheet}添加工作簿</button></div></div></div></dialog>`;
   content.innerHTML = `<section class="panel"><div class="panel-header"><div><h2>架上包工作簿配置</h2><p>支持合并日期单元格；同一投手在多个架上包中的消耗会自动求和。</p></div><button class="button primary" type="button" data-open-shelf-book>${icons.sheet}添加工作簿</button></div><div class="panel-body config-toolbar"><label class="search-field" for="shelfBookSearch"><span class="sr-only">搜索架上包工作簿</span><input id="shelfBookSearch" type="search" placeholder="搜索工作簿名或表格 ID" autocomplete="off"></label><span class="config-count">${shelf.books.length} 张工作簿</span></div></section><section class="panel"><div class="panel-header"><div><h2>已配置工作簿</h2><p>执行时会优先读取可见架上包表；投手消耗表支持隐藏页签。</p></div></div>${renderShelfBookCards(shelf.books)}</section>${drawerMarkup}`;
   const drawer = content.querySelector("#shelfBookDrawer");
   content.querySelector("[data-open-shelf-book]")?.addEventListener("click", () => drawer?.showModal());
@@ -875,7 +876,7 @@ function render() {
       : secondary
         ? "管理甲方日报与自己的日报配对。"
         : shelf
-          ? "识别架上包数据，按投手汇总消耗与回流消耗并写入投手消耗表。"
+          ? "识别架上包数据，按投手汇总消耗与回流消耗并写入投手消耗表和总表。"
           : "查看每日归集状态，确认空值跳过与冲突数据。";
   document.querySelectorAll(".menu-item").forEach((button) => {
     const active = button.dataset.page === state.page;
@@ -1051,7 +1052,7 @@ runButton.addEventListener("click", () => {
   runDialogText.textContent = state.page.startsWith("scenario2")
     ? "系统将先把非空数据安全写入对应投手日报，重新读取确认后再写入总表。目标已有不同值、渠道歧义或缺少日期行时不会覆盖。"
     : state.page.startsWith("scenario3")
-      ? "系统将识别可见架上包记录表，合并同一投手在多个架上包中的消耗与回流消耗，只写入投手消耗表中的空白目标单元格。已有不同数值不会覆盖。"
+      ? "系统将识别可见架上包记录表，合并同一投手在多个架上包中的消耗与回流消耗，同时写入投手消耗表和总表中的空白目标单元格。已有不同数值不会覆盖。"
       : "系统将重新读取所选业务日期，只写入总表中的空白目标单元格。源值为空时跳过，已有不同数值不会覆盖。";
   runDialog.showModal();
 });

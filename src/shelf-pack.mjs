@@ -155,6 +155,41 @@ function targetMetricColumns(values, header) {
   return { spend: header.spend, returnSpend: header.returnSpend, row };
 }
 
+function findTotalHeader(values) {
+  for (let row = 0; row < Math.min(values.length, 24); row += 1) {
+    const cells = values[row] || [];
+    const date = cells.findIndex((cell) => headerText(cell) === "日期" || headerText(cell) === "时间" || headerText(cell) === "date");
+    const total = cells.findIndex((cell) => /总消耗|汇总消耗/.test(String(cell ?? "")));
+    if (date >= 0 && total >= 0) return { row, date, total };
+  }
+  return null;
+}
+
+function locateTotalMetricColumn(values, header, shooter, metric) {
+  const aliases = new Set(shooterAliases(shooter));
+  const matches = [];
+  const cells = values[header.row] || [];
+  cells.forEach((cell, column) => {
+    const text = compact(cell);
+    const isReturn = /回流消耗|回流/.test(text);
+    const base = text.replace(/回流消耗$|回流$/, "");
+    if (!aliases.has(base)) return;
+    if ((metric === "消耗" && !isReturn) || (metric === "回流消耗" && isReturn)) matches.push(column);
+  });
+  if (matches.length === 1) return { column: matches[0] };
+  if (matches.length > 1) return { error: `总表中投手 ${shooter} 的${metric}列不唯一` };
+  return { error: `总表中未找到投手 ${shooter} 的${metric}列` };
+}
+
+function combineStatus(detail, total) {
+  const statuses = [detail?.status, total?.status];
+  if (statuses.includes("error")) return "error";
+  if (statuses.includes("conflict")) return "conflict";
+  if (statuses.includes("ready")) return "ready";
+  if (statuses.every((status) => status === "same" || status === "written")) return "same";
+  return "error";
+}
+
 function matchTargetSheet(shooter, targetSheets) {
   const aliases = shooterAliases(shooter);
   const scored = targetSheets.map((item) => {
@@ -192,8 +227,9 @@ export function aggregateShelfPackRows(results) {
   return [...groups.values()];
 }
 
-function mapShelfTargets(records, businessDate, targetSheets) {
+function mapShelfTargets(records, businessDate, targetSheets, totalSheet) {
   const targetCache = new Map(targetSheets.map((sheet) => [sheet.title, sheet]));
+  const totalHeader = findTotalHeader(totalSheet.values);
   const rows = [];
   for (const record of records) {
     const match = matchTargetSheet(record.shooter, targetSheets);
@@ -215,19 +251,50 @@ function mapShelfTargets(records, businessDate, targetSheets) {
       const target = targetCache.get(match.title);
       const header = findHeader(target.values, "shooter");
       const dateRow = header ? locateDateRow(target.values, header, businessDate) : -1;
+      let detail;
       if (!header) {
-        rows.push({ ...base, targetSheet: target.title, message: "投手消耗表未找到日期、消耗和回流表头" });
-        continue;
+        detail = { status: "error", message: "投手消耗表未找到日期、消耗和回流表头" };
+      } else if (dateRow < 0) {
+        detail = { status: "error", message: `投手消耗表缺少 ${businessDate} 日期行` };
+      } else {
+        const columns = targetMetricColumns(target.values, header);
+        const column = metric === "消耗" ? columns.spend : columns.returnSpend;
+        const range = `'${target.title.replaceAll("'", "''")}'!${columnName(column)}${dateRow + 1}`;
+        const inspection = inspectTarget(target.values[dateRow]?.[column], sourceValue, range);
+        detail = { ...inspection, range };
       }
-      if (dateRow < 0) {
-        rows.push({ ...base, targetSheet: target.title, message: `投手消耗表缺少 ${businessDate} 日期行` });
-        continue;
+
+      let total;
+      if (!totalHeader) {
+        total = { status: "error", message: "总表未找到日期和总消耗表头" };
+      } else {
+        const totalDateRow = locateDateRow(totalSheet.values, totalHeader, businessDate);
+        if (totalDateRow < 0) {
+          total = { status: "error", message: `总表缺少 ${businessDate} 日期行` };
+        } else {
+          const located = locateTotalMetricColumn(totalSheet.values, totalHeader, record.shooter, metric);
+          if (located.error) {
+            total = { status: "error", message: located.error };
+          } else {
+            const range = `'${totalSheet.title.replaceAll("'", "''")}'!${columnName(located.column)}${totalDateRow + 1}`;
+            total = { ...inspectTarget(totalSheet.values[totalDateRow]?.[located.column], sourceValue, range), range };
+          }
+        }
       }
-      const columns = targetMetricColumns(target.values, header);
-      const column = metric === "消耗" ? columns.spend : columns.returnSpend;
-      const range = `'${target.title.replaceAll("'", "''")}'!${columnName(column)}${dateRow + 1}`;
-      const inspection = inspectTarget(target.values[dateRow]?.[column], sourceValue, range);
-      rows.push({ ...base, targetSheet: target.title, targetValue: inspection.value, range, status: inspection.status });
+
+      const messages = [detail.message, total.message].filter(Boolean);
+      rows.push({
+        ...base,
+        targetSheet: target.title,
+        totalSheet: totalSheet.title,
+        targetValue: detail.value,
+        totalValue: total.value,
+        range: detail.range,
+        detail,
+        total,
+        status: combineStatus(detail, total),
+        message: messages.length ? messages.join("；") : undefined
+      });
     }
   }
   return rows;
@@ -244,20 +311,25 @@ export async function collectShelfBook(book, businessDate, deps = { getWorkbook,
   const visibleRackSheets = rackSheets.filter((sheet) => !sheet.hidden);
   const sourceSheets = visibleRackSheets.length ? visibleRackSheets : rackSheets;
   const targetSheets = sheets.filter((sheet) => classifyShelfSheet(sheet.values) === "shooter");
+  const totalSheets = sheets.filter((sheet) => compact(sheet.title) === "总表");
+  const totalSheet = totalSheets[0];
   if (!sourceSheets.length) throw new Error("未识别到架上包数据记录表");
   if (!targetSheets.length) throw new Error("未识别到投手消耗表");
+  if (!totalSheet) throw new Error("未识别到总表");
+  if (!findTotalHeader(totalSheet.values)) throw new Error("总表缺少日期和总消耗表头");
   const extracted = sourceSheets.map((sheet) => extractShelfPackRecords(sheet.values, sheet.title, businessDate));
   const records = aggregateShelfPackRows(extracted);
   const extractionErrors = extracted.flatMap((result) => result.status === "error"
     ? [{ status: "error", sourceSheet: result.sheetTitle, message: result.error }]
     : (result.rows || []).filter((row) => row.status === "error").map((row) => ({ ...row, sourceSheet: result.sheetTitle })));
-  const rows = [...extractionErrors, ...mapShelfTargets(records, businessDate, targetSheets)];
+  const rows = [...extractionErrors, ...mapShelfTargets(records, businessDate, targetSheets, totalSheet)];
   return {
     sourceId: book.id,
     sourceName: book.name,
     spreadsheetTitle: workbook.properties?.title || book.name,
     sourceSheetCount: sourceSheets.length,
     targetSheetCount: targetSheets.length,
+    totalSheetName: totalSheet.title,
     status: "success",
     businessDate,
     rows
@@ -266,16 +338,25 @@ export async function collectShelfBook(book, businessDate, deps = { getWorkbook,
 
 export async function executeShelfBook(book, businessDate, deps = { getWorkbook, getSheetValues, batchWrite }) {
   const preview = await collectShelfBook(book, businessDate, deps);
-  const updates = preview.rows
-    .filter((row) => row.status === "ready" && row.range)
-    .map((row) => ({ range: row.range, value: row.sourceValue }));
+  const updates = preview.rows.flatMap((row) => {
+    if (row.status !== "ready") return [];
+    return [row.detail, row.total]
+      .filter((target) => target?.status === "ready" && target.range)
+      .map((target) => ({ range: target.range, value: row.sourceValue }));
+  });
   await deps.batchWrite(book.spreadsheetId, updates);
   const verified = updates.length ? await collectShelfBook(book, businessDate, deps) : preview;
   const writtenRanges = new Set(updates.map((item) => item.range));
   return {
     ...verified,
-    rows: verified.rows.map((row) => writtenRanges.has(row.range) && row.status === "same"
-      ? { ...row, status: "written", message: "已写入并复核" }
-      : row)
+    rows: verified.rows.map((row) => {
+      const markWritten = (target) => target && writtenRanges.has(target.range) && target.status === "same"
+        ? { ...target, status: "written", message: "已写入并复核" }
+        : target;
+      const detail = markWritten(row.detail);
+      const total = markWritten(row.total);
+      const wrote = [detail, total].some((target) => target?.status === "written");
+      return wrote ? { ...row, detail, total, status: "written", message: "已写入并复核" } : { ...row, detail, total };
+    })
   };
 }
