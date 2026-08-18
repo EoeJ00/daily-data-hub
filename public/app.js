@@ -3,7 +3,8 @@ import { latestSuccessfulResultsByConfiguration } from "./spend-history.js";
 const state = {
   scenarios: {
     "scenario-1": { sources: [], runs: [] },
-    "scenario-2": { pairs: [], runs: [] }
+    "scenario-2": { pairs: [], runs: [] },
+    "scenario-3": { books: [], runs: [] }
   },
   connection: {},
   page: "overview",
@@ -42,7 +43,9 @@ const sidebarScroll = document.querySelector(".sidebar-scroll");
 const accordionStorageKey = "miulx.scenarioAccordion";
 
 function scenarioData(scenario = "scenario-1") {
-  return state.scenarios[scenario] || (scenario === "scenario-2" ? { pairs: [], runs: [] } : { sources: [], runs: [] });
+  return state.scenarios[scenario] || (scenario === "scenario-2"
+    ? { pairs: [], runs: [] }
+    : scenario === "scenario-3" ? { books: [], runs: [] } : { sources: [], runs: [] });
 }
 
 function scenarioApi(scenario, path) {
@@ -663,12 +666,12 @@ function errorGuidance(category) {
 function openRunDetail(scenario, run) {
   if (!runDetailDrawer) return;
   const summary = run.summary || {};
-  runDetailDrawerKicker.textContent = scenario === "scenario-2" ? "情景二 · 运行详情" : "情景一 · 运行详情";
+  runDetailDrawerKicker.textContent = scenario === "scenario-2" ? "情景二 · 运行详情" : scenario === "scenario-3" ? "架上包 · 运行详情" : "情景一 · 运行详情";
   runDetailDrawerTitle.textContent = run.type === "run" ? "正式写入" : "预览归集";
   const category = runStatus(run) === "error" ? classifyError(run.error || run.results?.find((item) => item.error)?.error) : "";
   runDetailDrawerMeta.textContent = String(run.businessDate || "未设置日期") + " · " + new Date(run.createdAt).toLocaleString("zh-CN") + " · " + (category || "处理完成");
   const insight = category ? '<div class="error-insight"><strong>' + escapeHtml(category) + '</strong><span>' + escapeHtml(run.error || "读取失败") + '</span><small>' + escapeHtml(errorGuidance(category)) + '</small></div>' : "";
-  runDetailDrawerBody.innerHTML = insight + (scenario === "scenario-2" ? renderScenario2RunDetails(run) : renderRunDetails(run));
+  runDetailDrawerBody.innerHTML = insight + (scenario === "scenario-2" ? renderScenario2RunDetails(run) : scenario === "scenario-3" ? renderShelfRunDetails(run) : renderRunDetails(run));
   runDetailDrawer.showModal();
 }
 
@@ -688,13 +691,13 @@ function renderRunsModern(scenario = "scenario-1") {
     const category = status === "error" ? classifyError(run.error || run.results?.find((item) => item.error)?.error) : "—";
     return '<tr><td>' + escapeHtml(new Date(run.createdAt).toLocaleString("zh-CN")) + '</td><td>' + escapeHtml(run.businessDate || "—") + '</td><td>' + (run.type === "run" ? badge("written") : badge("ready")) + '</td><td>' + formatNumber(summary.workbooks || summary.pairs || 0) + '</td><td>' + formatNumber((summary.written || 0) + (summary.ready || 0)) + '</td><td>' + formatNumber(summary.conflicts || 0) + '</td><td>' + (status === "error" ? badge("error") : '<span class="badge neutral">正常</span>') + '</td><td><button class="log-row-trigger" type="button" data-log-detail="' + escapeHtml(scenario + ":" + run.id) + '">查看详情</button><span class="log-category">' + escapeHtml(category) + '</span></td></tr>';
   }).join("");
-  const scenarioLabel = scenario === "scenario-2" ? "情景二" : "情景一";
-  content.innerHTML = '<section class="panel"><div class="panel-header"><div><h2>' + scenarioLabel + '运行日志</h2></div></div><div class="log-toolbar"><label>情景<select data-log-filter="scenario"><option value="scenario-1">情景一</option><option value="scenario-2">情景二</option></select></label><label>日期<input type="date" data-log-filter="date" value="' + escapeHtml(filters.date) + '"></label><label>状态<select data-log-filter="status"><option value="all">全部状态</option><option value="ready">待写入</option><option value="written">已写入</option><option value="error">异常</option></select></label><label>类型<select data-log-filter="type"><option value="all">全部类型</option><option value="preview">预览</option><option value="written">正式写入</option></select></label></div>' + (runs.length ? '<div class="table-wrap"><table><thead><tr><th>时间</th><th>业务日期</th><th>类型</th><th>工作簿</th><th>处理项</th><th>冲突</th><th>状态</th><th>详情</th></tr></thead><tbody>' + rows + '</tbody></table></div>' : '<div class="empty-state">' + icons.empty + '<h3>暂无符合条件的记录</h3></div>') + '</section>';
+  const scenarioLabel = scenario === "scenario-2" ? "情景二" : scenario === "scenario-3" ? "架上包" : "情景一";
+  content.innerHTML = '<section class="panel"><div class="panel-header"><div><h2>' + scenarioLabel + '运行日志</h2></div></div><div class="log-toolbar"><label>模块<select data-log-filter="scenario"><option value="scenario-1">情景一</option><option value="scenario-2">情景二</option><option value="scenario-3">架上包</option></select></label><label>日期<input type="date" data-log-filter="date" value="' + escapeHtml(filters.date) + '"></label><label>状态<select data-log-filter="status"><option value="all">全部状态</option><option value="ready">待写入</option><option value="written">已写入</option><option value="error">异常</option></select></label><label>类型<select data-log-filter="type"><option value="all">全部类型</option><option value="preview">预览</option><option value="written">正式写入</option></select></label></div>' + (runs.length ? '<div class="table-wrap"><table><thead><tr><th>时间</th><th>业务日期</th><th>类型</th><th>工作簿</th><th>处理项</th><th>冲突</th><th>状态</th><th>详情</th></tr></thead><tbody>' + rows + '</tbody></table></div>' : '<div class="empty-state">' + icons.empty + '<h3>暂无符合条件的记录</h3></div>') + '</section>';
   content.querySelector('[data-log-filter="date"]').addEventListener("change", (event) => { state.logFilters.date = event.target.value; renderRunsModern(scenario); });
   content.querySelector('[data-log-filter="status"]').value = filters.status;
   content.querySelector('[data-log-filter="type"]').value = filters.type;
   content.querySelector('[data-log-filter="scenario"]').value = scenario;
-  content.querySelector('[data-log-filter="scenario"]').addEventListener("change", (event) => { state.page = event.target.value === "scenario-2" ? "scenario2-runs" : "runs"; render(); });
+  content.querySelector('[data-log-filter="scenario"]').addEventListener("change", (event) => { state.page = event.target.value === "scenario-2" ? "scenario2-runs" : event.target.value === "scenario-3" ? "scenario3-runs" : "runs"; render(); });
   content.querySelectorAll('[data-log-filter="status"], [data-log-filter="type"]').forEach((control) => control.addEventListener("change", (event) => { state.logFilters[control.dataset.logFilter] = event.target.value; renderRunsModern(scenario); }));
   content.querySelectorAll("[data-log-detail]").forEach((button) => button.addEventListener("click", () => {
     const [targetScenario, id] = button.dataset.logDetail.split(":");
@@ -782,6 +785,49 @@ function renderScenario2ConfigModern() {
   content.querySelectorAll("[data-pair-delete]").forEach((button) => button.addEventListener("click", deletePair));
 }
 
+function renderShelfRunDetails(run) {
+  return `<div class="table-wrap"><table><thead><tr><th>投手</th><th>架上包来源</th><th>投手消耗表</th><th>指标</th><th>汇总值</th><th>结果</th><th>说明</th></tr></thead><tbody>${(run.results || []).flatMap((result) => result.rows?.length ? result.rows.map((row) => `<tr data-run-detail="${escapeHtml(run.id)}"><td><strong>${escapeHtml(row.displayShooter || row.shooter || "—")}</strong></td><td>${escapeHtml((row.packageDetails || []).map((item) => item.packageName).filter(Boolean).join("、") || result.sourceName || "—")}</td><td>${escapeHtml(row.targetSheet || "—")}</td><td>${escapeHtml(row.metric || "—")}</td><td>${formatNumber(row.sourceValue)}</td><td>${badge(row.status)}</td><td>${escapeHtml(row.message || row.range || "—")}</td></tr>`) : [`<tr data-run-detail="${escapeHtml(run.id)}"><td>${escapeHtml(result.sourceName || "架上包工作簿")}</td><td colspan="5">${badge("error")}</td><td>${escapeHtml(result.error || "未知错误")}</td></tr>`]).join("")}</tbody></table></div>`;
+}
+
+function renderScenario3Overview() {
+  const shelf = scenarioData("scenario-3");
+  const latest = shelf.runs[0];
+  const summary = latest?.summary || {};
+  content.innerHTML = `
+    <div class="metric-grid">
+      ${metric("已启用架上包表", shelf.books.filter((book) => book.enabled).length, `共配置 ${shelf.books.length} 张工作簿`)}
+      ${metric("待写入 / 已写入", (summary.ready || 0) + (summary.written || 0), "按投手汇总多个架上包后写入")}
+      ${metric("冲突", summary.conflicts || 0, "目标已有不同数值时不覆盖")}
+      ${metric("异常", summary.errors || 0, "未识别表格、投手页签或日期时保留记录")}
+    </div>
+    <section class="panel">
+      <div class="panel-header"><div><h2>最近一次架上包搬运结果</h2><p>${latest ? `${latest.businessDate} · ${latest.type === "run" ? "正式写入" : "预览"}` : "尚未执行任务"}</p></div>${latest ? `<span class="badge neutral">${new Date(latest.createdAt).toLocaleString("zh-CN")}</span>` : ""}</div>
+      ${latest ? renderShelfRunDetails(latest) : `<div class="empty-state">${icons.sheet}<h3>等待首次预览</h3><p>系统会自动识别架上包记录表和投手消耗表，再按投手汇总消耗与回流消耗。</p></div>`}
+    </section>`;
+  content.querySelectorAll("[data-run-detail]").forEach((row) => row.addEventListener("click", () => { const run = shelf.runs.find((item) => item.id === row.dataset.runDetail); if (run) openRunDetail("scenario-3", run); }));
+}
+
+function renderShelfBookCards(books) {
+  if (!books.length) return `<div class="empty-state">${icons.empty}<h3>尚未配置架上包工作簿</h3></div>`;
+  return `<div class="pair-card-list">${books.map((book) => `<article class="pair-card" data-search-row="${escapeHtml(`${book.name} ${book.spreadsheetId || ""}`.toLowerCase())}"><div><strong>${escapeHtml(book.name)}</strong><div class="pair-card-links"><a class="table-link" href="${escapeHtml(book.url)}" target="_blank" rel="noreferrer">打开 Google 表格</a><span>自动识别架上包表与投手消耗表</span></div></div><div class="pair-card-actions"><span class="badge ${book.enabled ? "" : "neutral"}">${book.enabled ? "已启用" : "已停用"}</span><button class="toggle ${book.enabled ? "on" : ""}" data-shelf-toggle="${escapeHtml(book.id)}" role="switch" aria-checked="${book.enabled}" aria-label="${book.enabled ? "停用" : "启用"}${escapeHtml(book.name)}"></button><button class="button small danger" data-shelf-delete="${escapeHtml(book.id)}">移除</button></div></article>`).join("")}</div>`;
+}
+
+function renderScenario3Config() {
+  const shelf = scenarioData("scenario-3");
+  const drawerMarkup = `<dialog id="shelfBookDrawer" class="detail-drawer-dialog config-drawer" aria-labelledby="shelfBookTitle"><div class="detail-drawer-card"><button class="detail-close" type="button" data-close-shelf-book aria-label="关闭添加架上包工作簿">×</button><div class="detail-kicker">架上包</div><h2 id="shelfBookTitle">添加架上包工作簿</h2><p>系统会自动区分架上包记录表和投手消耗表，目标写回同一工作簿内对应投手页签。</p><div class="drawer-form"><label>工作簿名<input id="shelfBookName" placeholder="例如：架上包数据表"></label><label>Google 表格链接<input id="shelfBookUrl" placeholder="https://docs.google.com/spreadsheets/d/..."></label><div class="drawer-actions"><button class="button secondary" type="button" data-close-shelf-book>取消</button><button class="button primary" id="addShelfBookButton" type="button">${icons.sheet}添加工作簿</button></div></div></div></dialog>`;
+  content.innerHTML = `<section class="panel"><div class="panel-header"><div><h2>架上包工作簿配置</h2><p>支持合并日期单元格；同一投手在多个架上包中的消耗会自动求和。</p></div><button class="button primary" type="button" data-open-shelf-book>${icons.sheet}添加工作簿</button></div><div class="panel-body config-toolbar"><label class="search-field" for="shelfBookSearch"><span class="sr-only">搜索架上包工作簿</span><input id="shelfBookSearch" type="search" placeholder="搜索工作簿名或表格 ID" autocomplete="off"></label><span class="config-count">${shelf.books.length} 张工作簿</span></div></section><section class="panel"><div class="panel-header"><div><h2>已配置工作簿</h2><p>执行时会优先读取可见架上包表；投手消耗表支持隐藏页签。</p></div></div>${renderShelfBookCards(shelf.books)}</section>${drawerMarkup}`;
+  const drawer = content.querySelector("#shelfBookDrawer");
+  content.querySelector("[data-open-shelf-book]")?.addEventListener("click", () => drawer?.showModal());
+  content.querySelectorAll("[data-close-shelf-book]").forEach((button) => button.addEventListener("click", () => drawer?.close()));
+  content.querySelector("#addShelfBookButton")?.addEventListener("click", addShelfBook);
+  content.querySelector("#shelfBookSearch")?.addEventListener("input", (event) => {
+    const query = event.target.value.trim().toLowerCase();
+    content.querySelectorAll("[data-search-row]").forEach((row) => { row.hidden = query && !row.dataset.searchRow.includes(query); });
+  });
+  content.querySelectorAll("[data-shelf-toggle]").forEach((button) => button.addEventListener("click", toggleShelfBook));
+  content.querySelectorAll("[data-shelf-delete]").forEach((button) => button.addEventListener("click", deleteShelfBook));
+}
+
 function renderChannel(row) {
   const target = row.targetChannel && row.targetChannel !== row.channel
     ? `<small class="channel-target">目标列：${escapeHtml(row.targetChannel)}</small>`
@@ -802,27 +848,35 @@ function render() {
     shooters: { title: "投手消耗", render: renderShooterPanel },
     "scenario2-overview": { title: "今日运行", render: renderScenario2Overview },
     "scenario2-config": { title: "工作簿配置", render: renderScenario2ConfigModern },
-    "scenario2-runs": { title: "运行日志", render: () => renderRunsModern("scenario-2") }
+    "scenario2-runs": { title: "运行日志", render: () => renderRunsModern("scenario-2") },
+    "scenario3-overview": { title: "今日运行", render: renderScenario3Overview },
+    "scenario3-config": { title: "工作簿配置", render: renderScenario3Config },
+    "scenario3-runs": { title: "运行日志", render: () => renderRunsModern("scenario-3") }
   };
   const page = pages[state.page] || pages.overview;
   const secondary = state.page.startsWith("scenario2");
+  const shelf = state.page.startsWith("scenario3");
   const shooterPage = state.page === "shooters";
   const standalonePage = state.page === "channels" || shooterPage;
-  const runPage = state.page === "overview" || state.page === "scenario2-overview";
+  const runPage = state.page === "overview" || state.page === "scenario2-overview" || state.page === "scenario3-overview";
   pageTitle.textContent = page.title;
-  topWorkspaceLabel.textContent = standalonePage ? "独立统计工作台" : secondary ? "配对日报工作台" : "投放统计工作台";
+  topWorkspaceLabel.textContent = standalonePage ? "独立统计工作台" : secondary ? "配对日报工作台" : shelf ? "架上包工作台" : "投放统计工作台";
   document.querySelector(".eyebrow").textContent = standalonePage
     ? `独立统计 / ${shooterPage ? "投手消耗" : "渠道消耗"}`
     : secondary
       ? (state.page === "scenario2-overview" ? "情景二 / 配对日报归集" : "情景二 / 工作簿配置")
-      : "情景一 / 渠道日报归集";
+      : shelf
+        ? (state.page === "scenario3-overview" ? "架上包 / 投手消耗搬运" : "架上包 / 工作簿配置")
+        : "情景一 / 渠道日报归集";
   document.querySelector(".content-subtitle").textContent = standalonePage
     ? shooterPage ? "按所选日期查看投手消耗。" : "查看截至所选日期最近 5 天的渠道消耗。"
     : state.page === "scenario2-overview"
       ? "查看情景二每日处理状态，确认空值跳过与冲突数据。"
       : secondary
         ? "管理甲方日报与自己的日报配对。"
-        : "查看每日归集状态，确认空值跳过与冲突数据。";
+        : shelf
+          ? "识别架上包数据，按投手汇总消耗与回流消耗并写入投手消耗表。"
+          : "查看每日归集状态，确认空值跳过与冲突数据。";
   document.querySelectorAll(".menu-item").forEach((button) => {
     const active = button.dataset.page === state.page;
     button.classList.toggle("active", active);
@@ -834,6 +888,7 @@ function render() {
   });
   document.querySelector('[data-scenario-status="scenario-1"]').textContent = scenarioData("scenario-1").sources?.some((source) => source.enabled) ? "已配置" : "待配置";
   document.querySelector('[data-scenario-status="scenario-2"]').textContent = scenarioData("scenario-2").pairs?.some((pair) => pair.enabled) ? "已配置" : "待配置";
+  document.querySelector('[data-scenario-status="scenario-3"]').textContent = scenarioData("scenario-3").books?.some((book) => book.enabled) ? "已配置" : "待配置";
   dateInput.closest(".date-field").hidden = !runPage;
   rulesButton.hidden = !runPage;
   previewButton.hidden = !runPage;
@@ -928,16 +983,51 @@ async function deletePair(event) {
   } catch (error) { notify(error.message, "error"); }
 }
 
+async function addShelfBook() {
+  const button = document.querySelector("#addShelfBookButton");
+  const name = document.querySelector("#shelfBookName").value;
+  const url = document.querySelector("#shelfBookUrl").value;
+  setLoading(button, true);
+  try {
+    const data = await api(scenarioApi("scenario-3", "/books"), { method: "POST", body: JSON.stringify({ name, url }) });
+    state.scenarios["scenario-3"].books = data.books;
+    notify("架上包工作簿已添加");
+    renderScenario3Config();
+  } catch (error) { notify(error.message, "error"); }
+  finally { setLoading(button, false); }
+}
+
+async function toggleShelfBook(event) {
+  const book = scenarioData("scenario-3").books.find((item) => item.id === event.currentTarget.dataset.shelfToggle);
+  if (!book) return;
+  try {
+    const data = await api(scenarioApi("scenario-3", `/books/${book.id}`), { method: "PATCH", body: JSON.stringify({ enabled: !book.enabled }) });
+    Object.assign(book, data.book);
+    renderScenario3Config();
+  } catch (error) { notify(error.message, "error"); }
+}
+
+async function deleteShelfBook(event) {
+  const book = scenarioData("scenario-3").books.find((item) => item.id === event.currentTarget.dataset.shelfDelete);
+  if (!book || !window.confirm(`确认移除“${book.name}”？不会删除 Google 表格。`)) return;
+  try {
+    const data = await api(scenarioApi("scenario-3", `/books/${book.id}`), { method: "DELETE" });
+    state.scenarios["scenario-3"].books = data.books;
+    notify("架上包工作簿已移除");
+    renderScenario3Config();
+  } catch (error) { notify(error.message, "error"); }
+}
+
 async function runJob(type, triggerButton = null) {
   const button = triggerButton || (type === "run" ? runButton : previewButton);
-  const scenario = state.page.startsWith("scenario2") ? "scenario-2" : "scenario-1";
+  const scenario = state.page.startsWith("scenario2") ? "scenario-2" : state.page.startsWith("scenario3") ? "scenario-3" : "scenario-1";
   setLoading(button, true);
   try {
     const run = await api(scenarioApi(scenario, `/jobs/${type}`), { method: "POST", body: JSON.stringify({ date: dateInput.value }) });
     state.scenarios[scenario].runs.unshift(run);
-    state.page = scenario === "scenario-2" ? "scenario2-overview" : "overview";
+    state.page = scenario === "scenario-2" ? "scenario2-overview" : scenario === "scenario-3" ? "scenario3-overview" : "overview";
     render();
-    notify(type === "run" ? `${scenario === "scenario-2" ? "配对日报" : "情景一"}正式写入任务已完成` : "预览已完成");
+    notify(type === "run" ? `${scenario === "scenario-2" ? "配对日报" : scenario === "scenario-3" ? "架上包" : "情景一"}正式写入任务已完成` : "预览已完成");
   } catch (error) { notify(error.message, "error"); }
   finally { setLoading(button, false); }
 }
@@ -950,7 +1040,8 @@ safetyRulesClose?.addEventListener("click", () => safetyRulesDialog?.close());
 safetyRulesDialog?.addEventListener("click", (event) => { if (event.target === safetyRulesDialog) safetyRulesDialog.close(); });
 document.querySelectorAll("[data-scenario-toggle]").forEach((button) => button.addEventListener("click", toggleScenarioAccordion));
 setScenarioAccordion("scenario-1", readScenarioAccordion("scenario-1", true));
-setScenarioAccordion("scenario-2", readScenarioAccordion("scenario-2", false));
+  setScenarioAccordion("scenario-2", readScenarioAccordion("scenario-2", false));
+  setScenarioAccordion("scenario-3", readScenarioAccordion("scenario-3", false));
 sidebarScroll.addEventListener("click", (event) => {
   const button = event.target.closest(".menu-item[data-page]");
   if (button && sidebarScroll.contains(button)) navigateToPage(button);
@@ -959,7 +1050,9 @@ previewButton.addEventListener("click", () => runJob("preview"));
 runButton.addEventListener("click", () => {
   runDialogText.textContent = state.page.startsWith("scenario2")
     ? "系统将先把非空数据安全写入对应投手日报，重新读取确认后再写入总表。目标已有不同值、渠道歧义或缺少日期行时不会覆盖。"
-    : "系统将重新读取所选业务日期，只写入总表中的空白目标单元格。源值为空时跳过，已有不同数值不会覆盖。";
+    : state.page.startsWith("scenario3")
+      ? "系统将识别可见架上包记录表，合并同一投手在多个架上包中的消耗与回流消耗，只写入投手消耗表中的空白目标单元格。已有不同数值不会覆盖。"
+      : "系统将重新读取所选业务日期，只写入总表中的空白目标单元格。源值为空时跳过，已有不同数值不会覆盖。";
   runDialog.showModal();
 });
 document.querySelector("#confirmRun").addEventListener("click", () => window.setTimeout(() => runJob("run"), 0));
@@ -975,7 +1068,8 @@ try {
   state.connection = data.connection || {};
   state.scenarios = data.scenarios || {
     "scenario-1": { sources: data.sources || [], runs: data.runs || [] },
-    "scenario-2": { pairs: [], runs: [] }
+    "scenario-2": { pairs: [], runs: [] },
+    "scenario-3": { books: [], runs: [] }
   };
   const connectionText = data.connection.configured ? "Google 已连接" : "等待 Google 凭据";
   document.querySelector("#connectionLabel").textContent = connectionText;

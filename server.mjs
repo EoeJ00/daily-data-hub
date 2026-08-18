@@ -4,6 +4,7 @@ import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collectWorkbook, executeWorkbook } from "./src/collector.mjs";
 import { collectScenario2Pair, executeScenario2Pair } from "./src/scenario2.mjs";
+import { collectShelfBook, executeShelfBook } from "./src/shelf-pack.mjs";
 import { getConnectionStatus } from "./src/google-sheets.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -12,10 +13,22 @@ const dataDir = join(root, "data");
 const stateFile = join(dataDir, "state.json");
 const port = Number(process.env.PORT || 4173);
 
+const defaultShelfBook = {
+  id: "shelf-pack-default",
+  name: "架上包数据表（副本）",
+  spreadsheetId: "1heP1gG4WDGQbDzoz1XROnG_cVoq-MIxOmIgPEZUBV64",
+  gid: "1263233284",
+  url: "https://docs.google.com/spreadsheets/d/1heP1gG4WDGQbDzoz1XROnG_cVoq-MIxOmIgPEZUBV64/edit#gid=1263233284",
+  enabled: true,
+  scenario: "scenario-3",
+  createdAt: "2026-08-18T00:00:00.000Z"
+};
+
 const defaultState = {
   scenarios: {
     "scenario-1": { sources: [], runs: [] },
-    "scenario-2": { pairs: [], runs: [] }
+    "scenario-2": { pairs: [], runs: [] },
+    "scenario-3": { books: [], runs: [] }
   }
 };
 const jsonHeaders = { "content-type": "application/json; charset=utf-8" };
@@ -40,6 +53,7 @@ async function readState() {
 function normalizeState(raw) {
   const primary = raw.scenarios?.["scenario-1"];
   const secondary = raw.scenarios?.["scenario-2"];
+  const shelf = raw.scenarios?.["scenario-3"];
   const legacySources = Array.isArray(raw.sources)
     ? raw.sources.filter((source) => (source.scenario || "scenario-1") === "scenario-1")
     : [];
@@ -55,6 +69,10 @@ function normalizeState(raw) {
       "scenario-2": {
         pairs: Array.isArray(secondary?.pairs) ? secondary.pairs : [],
         runs: Array.isArray(secondary?.runs) ? secondary.runs : []
+      },
+      "scenario-3": {
+        books: Array.isArray(shelf?.books) ? shelf.books : [structuredClone(defaultShelfBook)],
+        runs: Array.isArray(shelf?.runs) ? shelf.runs : []
       }
     }
   };
@@ -136,6 +154,18 @@ function newPair({ name, clientUrl, ownUrl }) {
   };
 }
 
+function newShelfBook({ name, url }) {
+  const parsed = parseSheetLink(url);
+  return {
+    id: crypto.randomUUID(),
+    name: String(name || "").trim() || parsed.name || "架上包数据表",
+    ...parsed,
+    enabled: true,
+    scenario: "scenario-3",
+    createdAt: new Date().toISOString()
+  };
+}
+
 function scenarioState(state, key = "scenario-1") {
   return state.scenarios[key];
 }
@@ -170,12 +200,14 @@ async function handleApi(request, response, pathname) {
   if (request.method === "GET" && pathname === "/api/bootstrap") {
     const primary = scenarioState(state);
     const secondary = scenarioState(state, "scenario-2");
+    const shelf = scenarioState(state, "scenario-3");
     return sendJson(response, 200, {
       sources: primary.sources,
       runs: primary.runs.slice(0, 50),
       scenarios: {
         "scenario-1": { sources: primary.sources, runs: primary.runs.slice(0, 50) },
-        "scenario-2": { pairs: secondary.pairs, runs: secondary.runs.slice(0, 50) }
+        "scenario-2": { pairs: secondary.pairs, runs: secondary.runs.slice(0, 50) },
+        "scenario-3": { books: shelf.books, runs: shelf.runs.slice(0, 50) }
       },
       connection: getConnectionStatus(),
       rules: { blankSource: "skip", zeroSource: "write" }
@@ -205,6 +237,20 @@ async function handleApi(request, response, pathname) {
     }
   }
 
+  if (request.method === "POST" && pathname === "/api/scenarios/scenario-3/books") {
+    const scope = scenarioState(state, "scenario-3");
+    try {
+      const book = newShelfBook(await readJson(request));
+      const duplicate = scope.books.find((item) => item.spreadsheetId === book.spreadsheetId);
+      if (duplicate) return sendJson(response, 409, { error: `工作簿已配置为“${duplicate.name}”` });
+      scope.books.push(book);
+      await saveState(state);
+      return sendJson(response, 200, { book, books: scope.books });
+    } catch (error) {
+      return sendJson(response, 400, { error: error.message });
+    }
+  }
+
   const pairMatch = pathname.match(/^\/api\/scenarios\/scenario-2\/pairs\/([^/]+)$/);
   if (pairMatch && request.method === "PATCH") {
     const scope = scenarioState(state, "scenario-2");
@@ -225,6 +271,28 @@ async function handleApi(request, response, pathname) {
     if (scope.pairs.length === before) return sendJson(response, 404, { error: "未找到该日报配对" });
     await saveState(state);
     return sendJson(response, 200, { pairs: scope.pairs });
+  }
+
+  const shelfBookMatch = pathname.match(/^\/api\/scenarios\/scenario-3\/books\/([^/]+)$/);
+  if (shelfBookMatch && request.method === "PATCH") {
+    const scope = scenarioState(state, "scenario-3");
+    const book = scope.books.find((item) => item.id === shelfBookMatch[1]);
+    if (!book) return sendJson(response, 404, { error: "未找到该架上包工作簿" });
+    const changes = await readJson(request);
+    for (const key of ["name", "enabled"]) {
+      if (key in changes) book[key] = changes[key];
+    }
+    await saveState(state);
+    return sendJson(response, 200, { book });
+  }
+
+  if (shelfBookMatch && request.method === "DELETE") {
+    const scope = scenarioState(state, "scenario-3");
+    const before = scope.books.length;
+    scope.books = scope.books.filter((item) => item.id !== shelfBookMatch[1]);
+    if (scope.books.length === before) return sendJson(response, 404, { error: "未找到该架上包工作簿" });
+    await saveState(state);
+    return sendJson(response, 200, { books: scope.books });
   }
 
   const scopedSourceMatch = pathname.match(/^\/api\/scenarios\/(scenario-1)\/sources\/([^/]+)$/);
@@ -303,6 +371,37 @@ async function handleApi(request, response, pathname) {
       id: crypto.randomUUID(),
       type: execute ? "run" : "preview",
       scenario: "scenario-2",
+      businessDate,
+      createdAt: new Date().toISOString(),
+      summary: summarize(results),
+      results
+    };
+    scope.runs.unshift(run);
+    scope.runs = scope.runs.slice(0, 50);
+    await saveState(state);
+    return sendJson(response, 200, run);
+  }
+
+  const shelfJobMatch = pathname.match(/^\/api\/scenarios\/scenario-3\/jobs\/(preview|run)$/);
+  if (shelfJobMatch && request.method === "POST") {
+    const { date, bookIds = [] } = await readJson(request);
+    const businessDate = date || new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+    const scope = scenarioState(state, "scenario-3");
+    const selected = scope.books.filter((book) => book.enabled && (!bookIds.length || bookIds.includes(book.id)));
+    if (!selected.length) return sendJson(response, 400, { error: "没有已启用的架上包工作簿" });
+    const execute = shelfJobMatch[1] === "run";
+    const results = [];
+    for (const book of selected) {
+      try {
+        results.push(await (execute ? executeShelfBook(book, businessDate) : collectShelfBook(book, businessDate)));
+      } catch (error) {
+        results.push({ sourceId: book.id, sourceName: book.name, status: "failed", error: error.message, rows: [] });
+      }
+    }
+    const run = {
+      id: crypto.randomUUID(),
+      type: execute ? "run" : "preview",
+      scenario: "scenario-3",
       businessDate,
       createdAt: new Date().toISOString(),
       summary: summarize(results),
