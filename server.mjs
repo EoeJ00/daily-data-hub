@@ -172,10 +172,10 @@ async function handleApi(request, response, pathname) {
     const secondary = scenarioState(state, "scenario-2");
     return sendJson(response, 200, {
       sources: primary.sources,
-      runs: primary.runs.slice(0, 20),
+      runs: primary.runs.slice(0, 50),
       scenarios: {
-        "scenario-1": { sources: primary.sources, runs: primary.runs.slice(0, 20) },
-        "scenario-2": { pairs: secondary.pairs, runs: secondary.runs.slice(0, 20) }
+        "scenario-1": { sources: primary.sources, runs: primary.runs.slice(0, 50) },
+        "scenario-2": { pairs: secondary.pairs, runs: secondary.runs.slice(0, 50) }
       },
       connection: getConnectionStatus(),
       rules: { blankSource: "skip", zeroSource: "write" }

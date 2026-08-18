@@ -578,7 +578,7 @@ tbody tr:hover { background: #fffaf0; box-shadow: inset 3px 0 0 var(--primary); 
 
 /* Operations console refinement: keep the task context visible while reducing visual noise. */
 .content-frame { width: min(1440px, 100%); padding-top: 24px; }
-.content-header { position: sticky; top: 0; z-index: 12; overflow: visible; margin-inline: -24px; padding: 14px 24px 18px; border-bottom: 1px solid rgba(210, 212, 201, .86); background: rgba(238, 239, 233, .96); backdrop-filter: blur(10px); }
+.content-header { position: sticky; top: 12px; z-index: 12; overflow: visible; margin-inline: 0; padding: 16px 20px 18px; border: 1px solid var(--border); border-radius: var(--radius-card); background: rgba(255, 255, 255, .96); box-shadow: 0 8px 24px rgba(24, 34, 48, .06); backdrop-filter: blur(12px); }
 .content-header-actions { align-items: flex-end; }
 .content-header .content-subtitle { max-width: 620px; }
 .panel { margin-bottom: 18px; }
@@ -598,12 +598,12 @@ tbody tr:hover { background: #fffaf0; box-shadow: inset 3px 0 0 var(--primary); 
 .date-trigger { min-width: 164px; }
 
 @media (max-width: 1024px) {
-  .content-header { margin-inline: -20px; padding-inline: 20px; }
+  .content-header { padding-inline: 18px; }
 }
 
 @media (max-width: 760px) {
   .content-frame { padding-top: 14px; }
-  .content-header { position: static; margin-inline: 0; padding: 0 0 18px; border-bottom: 0; background: transparent; backdrop-filter: none; }
+  .content-header { position: static; top: auto; margin-inline: 0; padding: 16px; border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); box-shadow: 0 4px 16px rgba(24, 34, 48, .05); backdrop-filter: none; }
   .content-header-actions { align-items: stretch; }
   .date-trigger { min-width: 0; }
   .panel > .table-wrap { max-height: none; }
@@ -838,5 +838,5 @@ tbody tr:hover { background: var(--primary-soft); box-shadow: inset 3px 0 0 var(
 .log-toolbar select { border-color: var(--border); background: var(--surface); }
 
 @media (max-width: 760px) {
-  .content-header { background: transparent; }
+  .content-header { background: var(--surface); }
 }

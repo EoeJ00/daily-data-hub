@@ -1,3 +1,5 @@
+import { latestSuccessfulResultsByConfiguration } from "./spend-history.js";
+
 const state = {
   scenarios: {
     "scenario-1": { sources: [], runs: [] },
@@ -335,13 +337,6 @@ function renderSourceTable(scenario = "scenario-1") {
     <tr data-search-row="${escapeHtml(`${source.name} ${source.spreadsheetId || ""} ${source.targetSheet || ""}`.toLowerCase())}"><td class="name-cell source-row" data-source-row="${source.id}"><div class="name-display"><strong>${escapeHtml(source.name)}</strong><button class="icon-button" data-edit-name="${source.id}" type="button" aria-label="编辑${escapeHtml(source.name)}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.7 4.7L8 20l11-11a2.8 2.8 0 0 0-4-4L4 16Z"/><path d="m13.5 6.5 4 4"/></svg></button></div><input class="inline-input" data-name-input="${source.id}" value="${escapeHtml(source.name)}" aria-label="编辑工作簿名"><small class="name-url">${escapeHtml(source.spreadsheetId || source.url)}</small></td><td>${escapeHtml(source.targetSheet || "—")}</td><td><span class="badge neutral">${scenarioLabel}</span></td><td><button class="toggle ${source.enabled ? "on" : ""}" data-toggle="${source.id}" role="switch" aria-checked="${source.enabled}" aria-label="${source.enabled ? "停用" : "启用"}${escapeHtml(source.name)}"></button></td><td><div class="actions"><a class="button small secondary" href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">打开</a><button class="button small danger" data-delete="${source.id}">移除</button></div></td></tr>`).join("")}</tbody></table></div>`;
 }
 
-function latestDataRun(scenario, businessDate = "") {
-  return scenarioData(scenario).runs.find((run) => {
-    if (businessDate && String(run.businessDate || "") !== businessDate) return false;
-    return run.results?.some((result) => result.status === "success" && result.rows?.some(spendEntry));
-  });
-}
-
 function shooterBusinessDates() {
   return [...new Set(["scenario-1", "scenario-2"].flatMap((scenario) => scenarioData(scenario).runs
     .filter((run) => run.businessDate && run.results?.some((result) => result.status === "success" && result.rows?.some(spendEntry)))
@@ -428,28 +423,34 @@ function displayChannelGroup(result, scenario) {
   return String(configured?.name || "").trim();
 }
 
+function latestDataResults(scenario, businessDate = "") {
+  const scenario2 = scenario === "scenario-2";
+  return latestSuccessfulResultsByConfiguration(scenarioData(scenario).runs, {
+    businessDate,
+    configurationKey: (result) => (scenario2 ? result.pairId : result.sourceId) || displayChannelGroup(result, scenario),
+    hasSpendData: (result) => result.rows?.some(spendEntry)
+  });
+}
+
 function shooterSpendRows(businessDate = "") {
-  const runs = [
-    { scenario: "scenario-1", run: latestDataRun("scenario-1", businessDate) },
-    { scenario: "scenario-2", run: latestDataRun("scenario-2", businessDate) }
-  ].filter((item) => item.run);
+  const snapshots = ["scenario-1", "scenario-2"].flatMap((scenario) =>
+    latestDataResults(scenario, businessDate).map(({ run, result }) => ({ scenario, run, result }))
+  );
+  const runs = [...new Map(snapshots.map(({ run }) => [run.id, run])).values()];
   const groups = new Map();
-  for (const { scenario, run } of runs) {
-    for (const result of run.results || []) {
-      if (result.status !== "success") continue;
-      const channelGroup = displayChannelGroup(result, scenario);
-      if (!channelGroup) continue;
-      for (const row of result.rows || []) {
-        const entry = spendEntry(row);
-        if (!entry) continue;
-        const chain = displayChain(row);
-        if (!chain || chain === "未识别") continue;
-        const shooter = displayShooter(row);
-        const key = `${channelGroup}\u0000${shooter}\u0000${chain}`;
-        const current = groups.get(key) || { channelGroup, shooter, chain, spend: 0, returnSpend: 0 };
-        current[entry.metric] += entry.value;
-        groups.set(key, current);
-      }
+  for (const { scenario, result } of snapshots) {
+    const channelGroup = displayChannelGroup(result, scenario);
+    if (!channelGroup) continue;
+    for (const row of result.rows || []) {
+      const entry = spendEntry(row);
+      if (!entry) continue;
+      const chain = displayChain(row);
+      if (!chain || chain === "未识别") continue;
+      const shooter = displayShooter(row);
+      const key = `${channelGroup}\u0000${shooter}\u0000${chain}`;
+      const current = groups.get(key) || { channelGroup, shooter, chain, spend: 0, returnSpend: 0 };
+      current[entry.metric] += entry.value;
+      groups.set(key, current);
     }
   }
   return { runs, rows: [...groups.values()].sort((a, b) => a.shooter.localeCompare(b.shooter, "zh-CN") || a.chain.localeCompare(b.chain, "zh-CN", { numeric: true })) };
