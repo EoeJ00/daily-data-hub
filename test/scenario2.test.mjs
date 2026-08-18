@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { collectScenario2Pair, dateKey, executeScenario2Pair, extractBigCellRecords, extractClientRecords, extractStandaloneChainRecords, normalizeRoute } from "../src/scenario2.mjs";
+import { collectScenario2Pair, dateKey, executeScenario2Pair, extractBigCellRecords, extractClientRecords, extractStandaloneChainRecords, locateTotalColumn, normalizeRoute } from "../src/scenario2.mjs";
 
 test("normalizes full and short channel formats to the same route code", () => {
   assert.deepEqual(normalizeRoute("MMY-XIONG-SS1-34（ROY）"), {
@@ -19,6 +19,27 @@ test("normalizes full and short channel formats to the same route code", () => {
 test("normalizes Google serial and short dates against the business year", () => {
   assert.equal(dateKey(46247, "2026-08-13"), "2026-08-13");
   assert.equal(dateKey("8.13", "2026-08-13"), "2026-08-13");
+});
+
+test("locates total columns by full, leading, or trailing chain fragments before shooter fallback", () => {
+  const target = { headerRow: 0 };
+  const route = normalizeRoute("Golden-island-2(C)");
+
+  assert.equal(locateTotalColumn([["日期", "Golden-island-2", "Golden-island-2回流"]], target, route, "消耗"), 1);
+  assert.equal(locateTotalColumn([["日期", "Golden-island", "Golden-island回流"]], target, route, "回流消耗"), 2);
+  assert.equal(locateTotalColumn([["日期", "island-2", "island-2回流"]], target, route, "消耗"), 1);
+  assert.equal(locateTotalColumn([["日期", "Golden-is", "Golden-is回流"]], target, route, "消耗"), 1);
+  assert.equal(locateTotalColumn([["日期", "land-2", "land-2回流"]], target, route, "回流消耗"), 2);
+  assert.equal(locateTotalColumn([["日期", "C", "C回流"]], target, route, "回流消耗"), 2);
+});
+
+test("prefers a chain fragment over a shooter-code column", () => {
+  const target = { headerRow: 0 };
+  const route = normalizeRoute("Golden-island-2(C)");
+  const values = [["日期", "C", "C回流", "island-2", "island-2回流"]];
+
+  assert.equal(locateTotalColumn(values, target, route, "消耗"), 3);
+  assert.equal(locateTotalColumn(values, target, route, "回流消耗"), 4);
 });
 
 test("extracts a repeated daily block and carries its merged date downward", () => {

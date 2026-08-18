@@ -127,6 +127,39 @@ function routeScore(left, right) {
   return Math.max(suffixScore(left, right), suffixScore(right, left));
 }
 
+function totalChainScore(left, right) {
+  const leftRoute = typeof left === "string" ? normalizeRoute(left) : left;
+  const rightRoute = typeof right === "string" ? normalizeRoute(right) : right;
+  const leftTokens = routeTokens(leftRoute);
+  const rightTokens = routeTokens(rightRoute);
+  if (!leftTokens.length || !rightTokens.length) return 0;
+  if (leftRoute.fullChain === rightRoute.fullChain) return 3000 + leftTokens.length;
+
+  const [shorter, longer] = leftTokens.length <= rightTokens.length
+    ? [leftTokens, rightTokens]
+    : [rightTokens, leftTokens];
+  const prefix = shorter.every((token, index) => token === longer[index]);
+  const suffixOffset = longer.length - shorter.length;
+  const suffix = shorter.every((token, index) => token === longer[suffixOffset + index]);
+  if (prefix || suffix) return 2000 + shorter.length;
+
+  const leftName = normalized(leftRoute.fullChain);
+  const rightName = normalized(rightRoute.fullChain);
+  const [shorterName, longerName] = leftName.length <= rightName.length
+    ? [leftName, rightName]
+    : [rightName, leftName];
+  return shorterName.length >= 2 && (longerName.startsWith(shorterName) || longerName.endsWith(shorterName))
+    ? 1500 + shorterName.length
+    : 0;
+}
+
+function shooterFallbackScore(targetRoute, headerRoute) {
+  const shooter = normalized(targetRoute?.shooter);
+  if (!shooter) return 0;
+  if (normalized(headerRoute?.shooter) === shooter) return 1000;
+  return normalized(headerRoute?.fullChain) === shooter ? 1000 : 0;
+}
+
 function looseRouteScore(left, right) {
   const source = typeof left === "string" ? normalizeRoute(left) : left;
   const target = typeof right === "string" ? normalizeRoute(right) : right;
@@ -489,15 +522,20 @@ function totalHeaderMetric(cells, column) {
   return { metric: isReturn ? "回流消耗" : "消耗", route: normalizeRoute(base) };
 }
 
-function locateTotalColumn(values, target, targetRoute, metric) {
-  const candidates = [];
+export function locateTotalColumn(values, target, targetRoute, metric) {
+  const chainCandidates = [];
+  const shooterCandidates = [];
   for (const row of [target.headerRow, target.headerRow - 1].filter((value) => value >= 0)) {
     for (let column = 0; column < (values[row] || []).length; column += 1) {
       const parsed = totalHeaderMetric(values[row], column);
-      const score = routeScore(targetRoute, parsed.route);
-      if (score > 0 && parsed.metric === metric) candidates.push({ column, score });
+      if (parsed.metric !== metric) continue;
+      const chainScore = totalChainScore(targetRoute, parsed.route);
+      if (chainScore > 0) chainCandidates.push({ column, score: chainScore });
+      const shooterScore = shooterFallbackScore(targetRoute, parsed.route);
+      if (shooterScore > 0) shooterCandidates.push({ column, score: shooterScore });
     }
   }
+  const candidates = chainCandidates.length ? chainCandidates : shooterCandidates;
   const maxScore = Math.max(0, ...candidates.map(({ score }) => score));
   const unique = [...new Set(candidates.filter(({ score }) => score === maxScore).map(({ column }) => column))];
   return unique.length === 1 ? unique[0] : unique.length ? -2 : -1;
