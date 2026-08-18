@@ -41,6 +41,7 @@ const topDateLabel = document.querySelector("#topDateLabel");
 const topWorkspaceLabel = document.querySelector("#topWorkspaceLabel");
 const sidebarScroll = document.querySelector(".sidebar-scroll");
 const accordionStorageKey = "miulx.scenarioAccordion";
+let activeJobRequest = false;
 
 function scenarioData(scenario = "scenario-1") {
   return state.scenarios[scenario] || (scenario === "scenario-2"
@@ -1020,9 +1021,13 @@ async function deleteShelfBook(event) {
 }
 
 async function runJob(type, triggerButton = null) {
+  if (activeJobRequest) return;
   const button = triggerButton || (type === "run" ? runButton : previewButton);
   const scenario = state.page.startsWith("scenario2") ? "scenario-2" : state.page.startsWith("scenario3") ? "scenario-3" : "scenario-1";
+  activeJobRequest = true;
   setLoading(button, true);
+  previewButton.disabled = true;
+  runButton.disabled = true;
   try {
     const run = await api(scenarioApi(scenario, `/jobs/${type}`), { method: "POST", body: JSON.stringify({ date: dateInput.value }) });
     state.scenarios[scenario].runs.unshift(run);
@@ -1030,7 +1035,12 @@ async function runJob(type, triggerButton = null) {
     render();
     notify(type === "run" ? `${scenario === "scenario-2" ? "配对日报" : scenario === "scenario-3" ? "架上包" : "情景一"}正式写入任务已完成` : "预览已完成");
   } catch (error) { notify(error.message, "error"); }
-  finally { setLoading(button, false); }
+  finally {
+    setLoading(button, false);
+    previewButton.disabled = false;
+    runButton.disabled = false;
+    activeJobRequest = false;
+  }
 }
 
 initDatePicker();

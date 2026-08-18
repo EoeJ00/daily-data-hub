@@ -68,3 +68,17 @@ test("fetchJson does not retry when only one attempt is allowed", async () => {
   );
   assert.equal(calls, 1);
 });
+
+test("fetchJson surfaces a Sheets quota response without multiplying reads", async () => {
+  let calls = 0;
+  const result = await fetchJson("https://example.test", {}, "Google Sheets 接口", {
+    attempts: 4,
+    fetchImpl: async () => {
+      calls += 1;
+      return jsonResponse({ error: { message: "Quota exceeded" } }, 429);
+    },
+    delay: async () => { throw new Error("quota response should not be retried"); }
+  });
+  assert.equal(result.response.status, 429);
+  assert.equal(calls, 1);
+});

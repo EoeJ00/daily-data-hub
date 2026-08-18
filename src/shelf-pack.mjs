@@ -1,4 +1,4 @@
-import { batchWrite, getSheetValues, getWorkbook } from "./google-sheets.mjs";
+import { batchWrite, getSheetValues, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
 import { mapConcurrent } from "./async-utils.mjs";
 
 const empty = (value) => value === undefined || value === null || (typeof value === "string" && value.trim() === "");
@@ -130,6 +130,20 @@ export function extractShelfPackRecords(values, sheetTitle, businessDate) {
 
 function locateDateRow(values, header, businessDate) {
   return values.findIndex((row, index) => index > header.row && dateKey(row?.[header.date], businessDate) === businessDate);
+}
+
+function parseCellRange(range) {
+  const separator = range.lastIndexOf("!");
+  if (separator < 0) return null;
+  const sheetPart = range.slice(0, separator);
+  const cell = range.slice(separator + 1);
+  const title = sheetPart.startsWith("'") && sheetPart.endsWith("'")
+    ? sheetPart.slice(1, -1).replaceAll("''", "'")
+    : sheetPart;
+  const match = cell.match(/^([A-Z]+)(\d+)$/i);
+  if (!match) return null;
+  const column = [...match[1].toUpperCase()].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
+  return { title, cell, row: Number(match[2]) - 1, column };
 }
 
 function inspectTarget(value, sourceValue, range) {
@@ -300,13 +314,25 @@ function mapShelfTargets(records, businessDate, targetSheets, totalSheet) {
   return rows;
 }
 
-export async function collectShelfBook(book, businessDate, deps = { getWorkbook, getSheetValues }) {
+async function readShelfSheets(spreadsheetId, properties, deps) {
+  const titles = properties.map((sheet) => sheet.title);
+  if (deps.getSheetValuesBatch) {
+    const ranges = titles.map((title) => `'${title.replaceAll("'", "''")}'`);
+    const values = await deps.getSheetValuesBatch(spreadsheetId, ranges);
+    return properties.map((sheet, index) => ({ ...sheet, values: values[index] || [] }));
+  }
+  return mapConcurrent(properties, async (sheet) => ({
+    ...sheet,
+    values: await deps.getSheetValues(spreadsheetId, sheet.title)
+  }), 6);
+}
+
+const defaultDeps = { getWorkbook, getSheetValues, getSheetValuesBatch, batchWrite };
+
+export async function collectShelfBook(book, businessDate, deps = defaultDeps) {
   const workbook = await deps.getWorkbook(book.spreadsheetId);
   const properties = workbook.sheets.filter(({ properties: sheet }) => !sheet?.title || sheet.title).map(({ properties: sheet }) => sheet);
-  const sheets = await mapConcurrent(properties, async (sheet) => ({
-    ...sheet,
-    values: await deps.getSheetValues(book.spreadsheetId, sheet.title)
-  }), 6);
+  const sheets = await readShelfSheets(book.spreadsheetId, properties, deps);
   const rackSheets = sheets.filter((sheet) => classifyShelfSheet(sheet.values) === "rack");
   const visibleRackSheets = rackSheets.filter((sheet) => !sheet.hidden);
   const sourceSheets = visibleRackSheets.length ? visibleRackSheets : rackSheets;
@@ -336,7 +362,45 @@ export async function collectShelfBook(book, businessDate, deps = { getWorkbook,
   };
 }
 
-export async function executeShelfBook(book, businessDate, deps = { getWorkbook, getSheetValues, batchWrite }) {
+async function verifyShelfWrites(book, preview, updates, deps) {
+  const ranges = [...new Set(updates.map((item) => item.range))];
+  const valuesByRange = new Map();
+  if (deps.getSheetValuesBatch) {
+    const values = await deps.getSheetValuesBatch(book.spreadsheetId, ranges);
+    ranges.forEach((range, index) => valuesByRange.set(range, values[index] || []));
+  } else {
+    await Promise.all(ranges.map(async (range) => {
+      const parsed = parseCellRange(range);
+      if (!parsed) return;
+      const values = await deps.getSheetValues(book.spreadsheetId, parsed.title, { range: parsed.cell });
+      valuesByRange.set(range, values);
+    }));
+  }
+  const readValue = (range) => {
+    const parsed = parseCellRange(range);
+    const values = valuesByRange.get(range) || [];
+    if (values.length === 1 && values[0]?.length === 1) return values[0][0];
+    return parsed ? values[parsed.row]?.[parsed.column] : undefined;
+  };
+  return {
+    ...preview,
+    rows: preview.rows.map((row) => {
+      const markWritten = (target) => {
+        if (!target || !valuesByRange.has(target.range)) return target;
+        const verified = inspectTarget(readValue(target.range), row.sourceValue, target.range);
+        return verified.status === "same"
+          ? { ...target, status: "written", value: verified.value, message: "已写入并复核" }
+          : { ...target, status: "error", value: verified.value, message: "写入后复核失败：目标值与汇总值不一致" };
+      };
+      const detail = markWritten(row.detail);
+      const total = markWritten(row.total);
+      const wrote = [detail, total].some((target) => target?.status === "written");
+      return wrote ? { ...row, detail, total, status: "written", message: "已写入并复核" } : { ...row, detail, total };
+    })
+  };
+}
+
+export async function executeShelfBook(book, businessDate, deps = defaultDeps) {
   const preview = await collectShelfBook(book, businessDate, deps);
   const updates = preview.rows.flatMap((row) => {
     if (row.status !== "ready") return [];
@@ -345,18 +409,5 @@ export async function executeShelfBook(book, businessDate, deps = { getWorkbook,
       .map((target) => ({ range: target.range, value: row.sourceValue }));
   });
   await deps.batchWrite(book.spreadsheetId, updates);
-  const verified = updates.length ? await collectShelfBook(book, businessDate, deps) : preview;
-  const writtenRanges = new Set(updates.map((item) => item.range));
-  return {
-    ...verified,
-    rows: verified.rows.map((row) => {
-      const markWritten = (target) => target && writtenRanges.has(target.range) && target.status === "same"
-        ? { ...target, status: "written", message: "已写入并复核" }
-        : target;
-      const detail = markWritten(row.detail);
-      const total = markWritten(row.total);
-      const wrote = [detail, total].some((target) => target?.status === "written");
-      return wrote ? { ...row, detail, total, status: "written", message: "已写入并复核" } : { ...row, detail, total };
-    })
-  };
+  return updates.length ? verifyShelfWrites(book, preview, updates, deps) : preview;
 }

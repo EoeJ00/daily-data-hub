@@ -1,5 +1,4 @@
-import { batchWrite, getSheetValues, getWorkbook } from "./google-sheets.mjs";
-import { mapConcurrent } from "./async-utils.mjs";
+import { batchWrite, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
 
 const empty = (value) => value === undefined || value === null || (typeof value === "string" && value.trim() === "");
 const normalized = (value) => String(value ?? "").trim().toLowerCase().replaceAll(/\s+/g, "");
@@ -136,14 +135,13 @@ export async function collectWorkbook(source, businessDate) {
     .map(({ properties }) => properties.title);
   if (!visibleSheets.includes(source.targetSheet)) throw new Error(`未找到目标页签：${source.targetSheet}`);
   const channels = visibleSheets.filter((title) => !source.excludedSheets.includes(title));
-  const targetValues = await getSheetValues(source.spreadsheetId, source.targetSheet);
+  const titles = [...new Set([source.targetSheet, ...channels])];
+  const ranges = titles.map((title) => `'${title.replaceAll("'", "''")}'`);
+  const values = await getSheetValuesBatch(source.spreadsheetId, ranges);
+  const valuesByTitle = new Map(titles.map((title, index) => [title, values[index] || []]));
+  const targetValues = valuesByTitle.get(source.targetSheet) || [];
   const target = locateTarget(targetValues, businessDate);
-  // Channel sheets are independent reads. Fetch them together, then flatten
-  // in the original order so result ordering and write semantics are stable.
-  const channelValues = await mapConcurrent(channels, async (channel) => ({
-    channel,
-    values: await getSheetValues(source.spreadsheetId, channel)
-  }));
+  const channelValues = channels.map((channel) => ({ channel, values: valuesByTitle.get(channel) || [] }));
   const rows = channelValues.flatMap(({ channel, values }) => extractChannel(values, source, channel, businessDate));
   return {
     sourceId: source.id,

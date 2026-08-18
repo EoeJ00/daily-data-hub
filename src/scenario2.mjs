@@ -1,4 +1,4 @@
-import { batchWrite, getSheetValues, getWorkbook } from "./google-sheets.mjs";
+import { batchWrite, getSheetValues, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
 import { mapConcurrent } from "./async-utils.mjs";
 
 const sourceAliases = {
@@ -487,10 +487,7 @@ async function collectChainSheetRecords(pair, businessDate, clientSheets, ownDes
   const matchedTitles = [...new Set(ownDescriptors.details
     .map((descriptor) => getMatch(descriptor).sheet?.title)
     .filter(Boolean))];
-  const clientValues = new Map(await mapConcurrent(matchedTitles, async (title) => [
-    title,
-    await deps.getSheetValues(pair.client.spreadsheetId, title)
-  ], 6));
+  const clientValues = await readSheetMap(pair.client.spreadsheetId, matchedTitles, deps);
   const rows = [];
   for (const descriptor of ownDescriptors.details) {
     const match = getMatch(descriptor);
@@ -557,14 +554,27 @@ function combineStatus(detail, total) {
   return "same";
 }
 
+async function readSheetMap(spreadsheetId, titles, deps, options = {}) {
+  const uniqueTitles = [...new Set(titles)];
+  if (deps.getSheetValuesBatch) {
+    const ranges = uniqueTitles.map((title) => `'${title.replaceAll("'", "''")}'`);
+    const values = await deps.getSheetValuesBatch(spreadsheetId, ranges, options);
+    return new Map(uniqueTitles.map((title, index) => [title, values[index] || []]));
+  }
+  return new Map(await mapConcurrent(uniqueTitles, async (title) => [
+    title,
+    await deps.getSheetValues(spreadsheetId, title, options)
+  ], 6));
+}
+
 async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
   const { totalSheet, details } = detailDescriptors(ownWorkbook, pair.targetSheet || "总表");
   if (!totalSheet) throw new Error(`自己的日报表未找到目标页签：${pair.targetSheet || "总表"}`);
   const targetDescriptors = details;
   const [totalValues, totalDisplayValues] = await Promise.all([
-    deps.getSheetValues(pair.own.spreadsheetId, totalSheet.title),
-    deps.getSheetValues(pair.own.spreadsheetId, totalSheet.title, { valueRenderOption: "FORMATTED_VALUE" })
-  ]);
+    readSheetMap(pair.own.spreadsheetId, [totalSheet.title], deps),
+    readSheetMap(pair.own.spreadsheetId, [totalSheet.title], deps, { valueRenderOption: "FORMATTED_VALUE" })
+  ]).then(([values, displayValues]) => [values.get(totalSheet.title) || [], displayValues.get(totalSheet.title) || []]);
   const totalTarget = locateTotal(totalValues, businessDate);
   const matchCache = new Map();
   const getMatch = (row) => {
@@ -576,10 +586,7 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
     .filter((row) => row.status === "pending")
     .map((row) => getMatch(row).descriptor?.sheet.title)
     .filter(Boolean))];
-  const detailCache = new Map(await mapConcurrent(matchedSheets, async (title) => [
-    title,
-    await deps.getSheetValues(pair.own.spreadsheetId, title)
-  ], 6));
+  const detailCache = await readSheetMap(pair.own.spreadsheetId, matchedSheets, deps);
   const detailMetaCache = new Map();
   const totalColumnCache = new Map();
   const rows = [];
@@ -662,7 +669,7 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
   return rows;
 }
 
-const defaultDeps = { getWorkbook, getSheetValues, batchWrite };
+const defaultDeps = { getWorkbook, getSheetValues, getSheetValuesBatch, batchWrite };
 
 export async function collectScenario2Pair(pair, businessDate, deps = defaultDeps) {
   const [clientWorkbook, ownWorkbook] = await Promise.all([

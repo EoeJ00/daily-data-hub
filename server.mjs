@@ -12,6 +12,7 @@ const publicDir = join(root, "public");
 const dataDir = join(root, "data");
 const stateFile = join(dataDir, "state.json");
 const port = Number(process.env.PORT || 4173);
+const activeJobKeys = new Set();
 
 const defaultShelfBook = {
   id: "shelf-pack-default",
@@ -85,6 +86,13 @@ async function saveState(state) {
 function sendJson(response, status, body) {
   response.writeHead(status, jsonHeaders);
   response.end(JSON.stringify(body));
+}
+
+function acquireJobLock(response, key) {
+  if (activeJobKeys.has(key)) return false;
+  activeJobKeys.add(key);
+  response.once("finish", () => activeJobKeys.delete(key));
+  return true;
 }
 
 async function readJson(request) {
@@ -322,6 +330,7 @@ async function handleApi(request, response, pathname) {
   const legacyJobMatch = pathname.match(/^\/api\/jobs\/(preview|run)$/);
   const jobType = scopedJobMatch?.[2] || legacyJobMatch?.[1];
   if (jobType && (scopedJobMatch || legacyJobMatch)) {
+    if (!acquireJobLock(response, "scenario-1")) return sendJson(response, 409, { error: "情景一已有任务正在执行，请稍后再试" });
     const { date, sourceIds = [] } = await readJson(request);
     const businessDate = date || new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
     const scope = scenarioState(state);
@@ -353,6 +362,7 @@ async function handleApi(request, response, pathname) {
 
   const scenario2JobMatch = pathname.match(/^\/api\/scenarios\/scenario-2\/jobs\/(preview|run)$/);
   if (scenario2JobMatch && request.method === "POST") {
+    if (!acquireJobLock(response, "scenario-2")) return sendJson(response, 409, { error: "情景二已有任务正在执行，请稍后再试" });
     const { date, pairIds = [] } = await readJson(request);
     const businessDate = date || new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
     const scope = scenarioState(state, "scenario-2");
@@ -384,6 +394,7 @@ async function handleApi(request, response, pathname) {
 
   const shelfJobMatch = pathname.match(/^\/api\/scenarios\/scenario-3\/jobs\/(preview|run)$/);
   if (shelfJobMatch && request.method === "POST") {
+    if (!acquireJobLock(response, "scenario-3")) return sendJson(response, 409, { error: "架上包已有任务正在执行，请稍后再试" });
     const { date, bookIds = [] } = await readJson(request);
     const businessDate = date || new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
     const scope = scenarioState(state, "scenario-3");

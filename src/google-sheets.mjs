@@ -4,7 +4,10 @@ import { createPrivateKey, sign } from "node:crypto";
 let tokenCache;
 let tokenRequest;
 
-const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+// A 429 from Sheets is usually the per-user read quota. Retrying immediately
+// only consumes more quota and obscures the actionable error, so surface it
+// to the caller. Transient server/network failures remain retryable.
+const RETRYABLE_STATUS = new Set([408, 500, 502, 503, 504]);
 const READ_ATTEMPTS = 4;
 
 function wait(milliseconds) {
@@ -129,10 +132,25 @@ export async function getWorkbook(spreadsheetId) {
 }
 
 export async function getSheetValues(spreadsheetId, sheetTitle, options = {}) {
-  const range = encodeURIComponent(`'${sheetTitle.replaceAll("'", "''")}'`);
+  const selectedRange = options.range
+    ? `'${sheetTitle.replaceAll("'", "''")}'!${options.range}`
+    : `'${sheetTitle.replaceAll("'", "''")}'`;
+  const range = encodeURIComponent(selectedRange);
   const valueRenderOption = options.valueRenderOption || "UNFORMATTED_VALUE";
   const data = await googleRequest(`spreadsheets/${spreadsheetId}/values/${range}?majorDimension=ROWS&valueRenderOption=${encodeURIComponent(valueRenderOption)}`);
   return data.values || [];
+}
+
+/**
+ * Read several A1 ranges in one Sheets API request. This is intentionally
+ * separate from getSheetValues so existing callers keep their simple shape.
+ */
+export async function getSheetValuesBatch(spreadsheetId, ranges, options = {}) {
+  if (!ranges.length) return [];
+  const valueRenderOption = options.valueRenderOption || "UNFORMATTED_VALUE";
+  const query = ranges.map((range) => `ranges=${encodeURIComponent(range)}`).join("&");
+  const data = await googleRequest(`spreadsheets/${spreadsheetId}/values:batchGet?${query}&majorDimension=ROWS&valueRenderOption=${encodeURIComponent(valueRenderOption)}`);
+  return (data.valueRanges || []).map((item) => item.values || []);
 }
 
 export async function batchWrite(spreadsheetId, updates) {

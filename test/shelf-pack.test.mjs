@@ -66,7 +66,17 @@ test("aggregates one shooter across multiple rack packages and maps both metrics
       { properties: { title: "C", hidden: true } },
       { properties: { title: "总表", hidden: false } }
     ] }),
-    getSheetValues: async (id, sheet) => values.get(`${id}:${sheet}`) || []
+    getSheetValues: async (id, sheet) => values.get(`${id}:${sheet}`) || [],
+    getSheetValuesBatch: async (id, ranges) => ranges.map((range) => {
+      const sheetPart = range.split("!")[0];
+      const title = sheetPart.slice(1, -1).replaceAll("''", "'");
+      const full = values.get(`${id}:${title}`) || [];
+      const cell = range.split("!")[1];
+      if (!cell) return full;
+      const match = cell.match(/^([A-Z]+)(\d+)$/);
+      const column = [...match[1]].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
+      return [[full[Number(match[2]) - 1]?.[column]]];
+    })
   };
   const result = await collectShelfBook({ id: "book-id", name: "架上包数据表", spreadsheetId: "book" }, "2026-08-13", deps);
   assert.equal(result.sourceSheetCount, 2);
@@ -86,6 +96,7 @@ test("aggregates one shooter across multiple rack packages and maps both metrics
   const executed = await executeShelfBook({ id: "book-id", name: "架上包数据表", spreadsheetId: "book" }, "2026-08-13", {
     getWorkbook: deps.getWorkbook,
     getSheetValues: deps.getSheetValues,
+    getSheetValuesBatch: deps.getSheetValuesBatch,
     batchWrite: async (_id, updates) => {
       writes.push(...updates);
       for (const update of updates) {
