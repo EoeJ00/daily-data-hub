@@ -1,0 +1,14 @@
+{
+  "name": "daily-data-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs && node --check src/google-sheets.mjs && node --check src/async-utils.mjs && node --check src/collector.mjs && node --check src/scenario2.mjs && node --check public/app.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

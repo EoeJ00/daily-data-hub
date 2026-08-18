@@ -1,0 +1,197 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { collectScenario2Pair, dateKey, executeScenario2Pair, extractBigCellRecords, extractClientRecords, extractStandaloneChainRecords, normalizeRoute } from "../src/scenario2.mjs";
+
+test("normalizes full and short channel formats to the same route code", () => {
+  assert.deepEqual(normalizeRoute("MMY-XIONG-SS1-34（ROY）"), {
+    raw: "MMY-XIONG-SS1-34（ROY）",
+    base: "MMY-XIONG-SS1-34",
+    fullChain: "mmy-xiong-ss1-34",
+    code: "34",
+    shooter: "roy"
+  });
+  assert.equal(normalizeRoute("034(ROY)").code, "34");
+  assert.equal(normalizeRoute("34 ( ROY )").shooter, "roy");
+  assert.equal(normalizeRoute("11yXxZgy02(SUKI)").code, "2");
+  assert.equal(normalizeRoute("5525006-FB-在投").code, "5525006");
+});
+
+test("normalizes Google serial and short dates against the business year", () => {
+  assert.equal(dateKey(46247, "2026-08-13"), "2026-08-13");
+  assert.equal(dateKey("8.13", "2026-08-13"), "2026-08-13");
+});
+
+test("extracts a repeated daily block and carries its merged date downward", () => {
+  const values = [
+    ["日报总表"],
+    ["日期", "渠道号", "花费（U）", "回流"],
+    [46247, "MMY-XIONG-SS1-34", "", 0.86],
+    ["", "35(ROY)", 12.5, 0],
+    ["汇总", "", 12.5, 0.86],
+    ["日报总表"],
+    ["日期", "渠道号", "花费（U）", "回流"],
+    [46248, "MMY-XIONG-SS1-34", 20, 1]
+  ];
+  const rows = extractClientRecords(values, "2026-08-13", "BI（日报总表）");
+  assert.equal(rows.length, 4);
+  assert.deepEqual(rows.map((row) => [row.routeCode, row.metric, row.status, row.sourceValue]), [
+    ["34", "消耗", "blank", undefined],
+    ["34", "回流消耗", "pending", 0.86],
+    ["35", "消耗", "pending", 12.5],
+    ["35", "回流消耗", "pending", 0]
+  ]);
+});
+
+test("extracts labeled metrics from a multiline daily cell without guessing unlabeled numbers", () => {
+  const values = [["2026.8.13\n34（ROY） 消耗：10.25 回流消耗：0.86\nMMY-XIONG-SS1-37(YC)\n消耗 19.33\n回流 0.32"]];
+  const rows = extractBigCellRecords(values, "2026-08-13", "日报大单元格");
+  assert.deepEqual(rows.map((row) => [row.routeCode, row.metric, row.status, row.sourceValue]), [
+    ["34", "消耗", "pending", 10.25],
+    ["34", "回流消耗", "pending", 0.86],
+    ["37", "消耗", "pending", 19.33],
+    ["37", "回流消耗", "pending", 0.32]
+  ]);
+});
+
+function scenario2Fixture() {
+  const clientId = "client";
+  const ownId = "own";
+  const values = new Map([
+    [`${clientId}:BI（日报总表）`, [
+      ["日报总表"],
+      ["日期", "渠道号", "花费（U）", "回流"],
+      [46247, "MMY-XIONG-SS1-34", 10.25, 0.86],
+      ["", "MMY-XIONG-SS1-37", 19.33, 0.32],
+      ["汇总", "", 29.58, 1.18]
+    ]],
+    [`${ownId}:总表`, [
+      ["日期", "总消耗", "34", "34回流", "37", "37回流"],
+      [46247, "", "", "", "", ""]
+    ]],
+    [`${ownId}:34(ROY)`, [
+      ["日报总表"],
+      ["日期", "渠道号", "花费（U）", "回流"],
+      [46247, "", "", ""]
+    ]],
+    [`${ownId}:37(YC)`, [
+      ["日报总表"],
+      ["日期", "渠道号", "花费（U）", "回流"],
+      [46247, "MMY-XIONG-EVO-37", "", ""]
+    ]]
+  ]);
+  const workbook = (id) => id === clientId
+    ? { properties: { title: "甲方日报" }, sheets: [{ properties: { sheetId: 1, title: "BI（日报总表）" } }] }
+    : { properties: { title: "自己的日报" }, sheets: ["总表", "34(ROY)", "37(YC)"].map((title, index) => ({ properties: { sheetId: index + 1, title } })) };
+  const columnIndex = (letters) => [...letters].reduce((sum, letter) => sum * 26 + letter.charCodeAt(0) - 64, 0) - 1;
+  const deps = {
+    getWorkbook: async (id) => workbook(id),
+    getSheetValues: async (id, sheet) => values.get(`${id}:${sheet}`),
+    batchWrite: async (id, updates) => {
+      for (const update of updates) {
+        const match = update.range.match(/^'(.+)'!([A-Z]+)(\d+)$/);
+        const rows = values.get(`${id}:${match[1].replaceAll("''", "'")}`);
+        const row = Number(match[3]) - 1;
+        const column = columnIndex(match[2]);
+        rows[row][column] = update.value;
+      }
+      return { totalUpdatedCells: updates.length };
+    }
+  };
+  return {
+    pair: { id: "pair", name: "测试配对", client: { spreadsheetId: clientId, gid: "1" }, own: { spreadsheetId: ownId }, targetSheet: "总表" },
+    deps
+  };
+}
+
+test("maps a client daily block to unique shooter sheets and total columns", async () => {
+  const { pair, deps } = scenario2Fixture();
+  const preview = await collectScenario2Pair(pair, "2026-08-13", deps);
+  assert.equal(preview.channelCount, 2);
+  assert.equal(preview.rows.length, 4);
+  assert.ok(preview.rows.every((row) => row.status === "ready"));
+  assert.equal(preview.rows.find((row) => row.routeCode === "37" && row.metric === "消耗").targetSheet, "37(YC)");
+});
+
+test("matches semantic fields and compound channel suffixes without workbook-specific rules", async () => {
+  const clientId = "compound-client";
+  const ownId = "compound-own";
+  const rawValues = new Map([
+    [`${clientId}:甲方明细`, [
+      ["余额", "打款", "统计日期", "投放渠道名称", "服务费", "当日消耗", "实际消耗", "回流花费"],
+      [0, 0, 46247, "XIAOXIONG-w2a-4-fb-RS9-CS-11-1", 2.8, 40.1, 42.9, 1.18],
+      [0, 0, 46247, "XIAOXIONG-w2a-4-fb-RS9-CS-11-4", 2.9, 40.97, 43.84, 0.41]
+    ]],
+    [`${ownId}:总表`, [
+      ["日期", "总消耗", 46327, "回流", 46330, "回流"],
+      [46247, 82.66, 40.1, 1.18, 40.97, 0.41]
+    ]],
+    [`${ownId}:RS9-CS-11-1(SUKI)`, [
+      ["日期", "渠道名", "服务费", "消耗", "回流消耗"],
+      [46247, "", 0, 40.1, 1.18]
+    ]],
+    [`${ownId}:RS9-CS-11-4(SUKI)`, [
+      ["日期", "渠道名", "服务费", "消耗", "回流消耗"],
+      [46247, "", 0, 40.97, 0.41]
+    ]]
+  ]);
+  const displayTotal = [
+    ["日期", "总消耗", "11-1", "回流", "11-4", "回流"],
+    ["2026/8/13", "82.660", "40.100", "1.180", "40.970", "0.410"]
+  ];
+  const deps = {
+    getWorkbook: async (id) => id === clientId
+      ? { properties: { title: "甲方表" }, sheets: [{ properties: { sheetId: 1, title: "甲方明细" } }] }
+      : { properties: { title: "自己的日报" }, sheets: ["总表", "RS9-CS-11-1(SUKI)", "RS9-CS-11-4(SUKI)"].map((title, index) => ({ properties: { sheetId: index + 1, title } })) },
+    getSheetValues: async (id, sheet, options = {}) => options.valueRenderOption === "FORMATTED_VALUE" && sheet === "总表"
+      ? displayTotal
+      : rawValues.get(`${id}:${sheet}`),
+    batchWrite: async () => ({ totalUpdatedCells: 0 })
+  };
+  const pair = { id: "compound", name: "复合渠道", client: { spreadsheetId: clientId, gid: "1" }, own: { spreadsheetId: ownId }, targetSheet: "总表" };
+  const preview = await collectScenario2Pair(pair, "2026-08-13", deps);
+
+  assert.equal(preview.channelCount, 2);
+  assert.equal(preview.rows.length, 4);
+  assert.ok(preview.rows.every((row) => row.status === "same"));
+  assert.deepEqual([...new Set(preview.rows.map((row) => row.routeKey))], ["RS9-CS-11-1", "RS9-CS-11-4"]);
+  assert.equal(preview.rows.find((row) => row.channel.endsWith("11-4") && row.metric === "回流消耗").targetSheet, "RS9-CS-11-4(SUKI)");
+});
+
+test("writes detail rows first, rechecks them, and then writes the total", async () => {
+  const { pair, deps } = scenario2Fixture();
+  const result = await executeScenario2Pair(pair, "2026-08-13", deps);
+  assert.ok(result.rows.every((row) => row.status === "written"));
+  assert.ok(result.rows.every((row) => row.detail.status === "same" && row.total.status === "same"));
+});
+
+test("reads one client chain per visible sheet and maps it by chain identity", async () => {
+  const clientId = "single-sheet-client";
+  const ownId = "single-sheet-own";
+  const values = new Map([
+    [`${clientId}:SS1-34(ROY)`, [["日期", "消耗", "回流消耗"], [46247, 18.2, 0.4]]],
+    [`${clientId}:MMY-XIONG-SS1-37(YC)`, [["日期", "消耗", "回流消耗"], [46247, 9.3, 0]]],
+    [`${ownId}:总表`, [["日期", "34", "34回流", "37", "37回流"], [46247, "", "", "", ""]]],
+    [`${ownId}:34(ROY)`, [["日期", "渠道号", "消耗", "回流消耗"], [46247, "", "", ""]]],
+    [`${ownId}:37(YC)`, [["日期", "渠道号", "消耗", "回流消耗"], [46247, "", "", ""]]]
+  ]);
+  const workbook = (id) => id === clientId
+    ? { properties: { title: "甲方逐链日报" }, sheets: ["汇总", "SS1-34(ROY)", "MMY-XIONG-SS1-37(YC)"].map((title, index) => ({ properties: { sheetId: index + 1, title } })) }
+    : { properties: { title: "自己的日报" }, sheets: ["总表", "34(ROY)", "37(YC)"].map((title, index) => ({ properties: { sheetId: index + 1, title } })) };
+  const deps = {
+    getWorkbook: async (id) => workbook(id),
+    getSheetValues: async (id, sheet) => values.get(`${id}:${sheet}`) || [],
+    batchWrite: async () => ({ totalUpdatedCells: 0 })
+  };
+  const pair = { id: "single-sheet-pair", name: "逐链配对", client: { spreadsheetId: clientId, gid: "1" }, own: { spreadsheetId: ownId }, targetSheet: "总表" };
+  const preview = await collectScenario2Pair(pair, "2026-08-13", deps);
+  assert.equal(preview.sourceSheet, "多链独立工作表");
+  assert.equal(preview.rows.length, 4);
+  assert.ok(preview.rows.every((row) => row.status === "ready"));
+  assert.deepEqual([...new Set(preview.rows.map((row) => row.routeKey))].sort(), ["34", "37"]);
+});
+
+test("rejects a standalone chain sheet when the requested date is absent", () => {
+  const rows = extractStandaloneChainRecords([["日期", "消耗", "回流消耗"], [46248, 10, 1]], "2026-08-13", "MMY-XIONG-SS1-34(ROY)", "MMY-XIONG-SS1-34(ROY)");
+  assert.equal(rows.length, 2);
+  assert.ok(rows.every((row) => row.status === "error"));
+});

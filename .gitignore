@@ -1,0 +1,5 @@
+data/state.json
+data/launcher.log
+.env
+node_modules/
+授权邮箱/

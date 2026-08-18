@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#eeefe9">
+  <meta name="description" content="MIULX 多工作簿渠道日报自动归集控制台">
+  <title>MIULX · 投放统计</title>
+    <link rel="stylesheet" href="/styles.css?v=20260817-spend-workspace-1">
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+  <div class="app-shell">
+    <header class="top-navigation">
+      <a class="top-logo" href="#" aria-label="MIULX 投放统计首页">
+        <span class="top-logo-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 18V6l4 7 4-7v12M16 18V6l4 12"/></svg></span>
+        <span><strong>MIULX</strong><small>DATA OPS</small></span>
+      </a>
+      <div class="top-context" role="status" aria-live="polite"><span class="top-context-dot"></span><span id="topWorkspaceLabel">投放统计工作台</span><span class="top-context-divider"></span><span id="topConnectionText">连接检查中</span></div>
+      <div class="top-actions">
+        <span class="top-date" id="topDateLabel"></span>
+        <button class="profile-button" type="button" aria-label="当前用户：运营工作台"><span class="profile-avatar">M</span><span class="profile-name">运营工作台</span></button>
+      </div>
+    </header>
+
+    <div class="workspace-shell">
+      <aside class="sidebar" aria-label="一级菜单">
+        <div class="sidebar-scroll">
+          <section class="scenario-group" data-scenario-group="scenario-1">
+            <button class="scenario-toggle is-open" data-scenario-toggle="scenario-1" type="button" title="情景一" aria-expanded="true" aria-controls="scenario-1-panel">
+              <span class="scenario-toggle-mark" aria-hidden="true">01</span><span class="scenario-toggle-label">情景一</span><span class="scenario-toggle-status" data-scenario-status="scenario-1"></span><span class="scenario-toggle-arrow" aria-hidden="true">⌄</span>
+            </button>
+            <div class="scenario-group-panel is-open" id="scenario-1-panel" aria-hidden="false">
+              <div class="scenario-group-inner">
+                <nav class="primary-menu" aria-label="情景一功能">
+                  <button class="menu-item active" data-page="overview" aria-label="今日运行" title="今日运行"><span class="menu-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg></span><span class="menu-label">今日运行</span><span class="menu-arrow" aria-hidden="true">›</span></button>
+                  <button class="menu-item" data-page="sources" aria-label="工作簿配置" title="工作簿配置"><span class="menu-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6"/></svg></span><span class="menu-label">工作簿配置</span><span class="menu-arrow" aria-hidden="true">›</span></button>
+                  <button class="menu-item" data-page="runs" aria-label="运行日志" title="运行日志"><span class="menu-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg></span><span class="menu-label">运行日志</span><span class="menu-arrow" aria-hidden="true">›</span></button>
+                </nav>
+              </div>
+            </div>
+          </section>
+          <section class="scenario-group" data-scenario-group="scenario-2">
+            <button class="scenario-toggle" data-scenario-toggle="scenario-2" type="button" title="情景二" aria-expanded="false" aria-controls="scenario-2-panel">
+              <span class="scenario-toggle-mark" aria-hidden="true">02</span><span class="scenario-toggle-label">情景二</span><span class="scenario-toggle-status" data-scenario-status="scenario-2"></span><span class="scenario-toggle-arrow" aria-hidden="true">⌄</span>
+            </button>
+            <div class="scenario-group-panel" id="scenario-2-panel" aria-hidden="true">
+              <div class="scenario-group-inner">
+                <nav class="primary-menu" aria-label="情景二功能">
+                  <button class="menu-item" data-page="scenario2-overview" aria-label="情景二今日运行" title="今日运行"><span class="menu-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg></span><span class="menu-label">今日运行</span><span class="menu-arrow" aria-hidden="true">›</span></button>
+                  <button class="menu-item" data-page="scenario2-config" aria-label="情景二工作簿配置" title="工作簿配置"><span class="menu-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6"/></svg></span><span class="menu-label">工作簿配置</span><span class="menu-arrow" aria-hidden="true">›</span></button>
+                  <button class="menu-item" data-page="scenario2-runs" aria-label="情景二运行日志" title="运行日志"><span class="menu-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg></span><span class="menu-label">运行日志</span><span class="menu-arrow" aria-hidden="true">›</span></button>
+                </nav>
+              </div>
+            </div>
+          </section>
+          <nav class="primary-menu standalone-menu" aria-label="独立统计功能">
+            <button class="menu-item" data-page="channels" aria-label="渠道消耗" title="渠道消耗"><span class="menu-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 19V5M4 19h16"/><path d="m7 15 3-4 3 2 5-7"/></svg></span><span class="menu-label">渠道消耗</span><span class="menu-arrow" aria-hidden="true">›</span></button>
+            <button class="menu-item" data-page="shooters" aria-label="投手消耗" title="投手消耗"><span class="menu-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3"/><path d="M5 20c.8-3.4 3.1-5 7-5s6.2 1.6 7 5"/></svg></span><span class="menu-label">投手消耗</span><span class="menu-arrow" aria-hidden="true">›</span></button>
+          </nav>
+        </div>
+        <div class="sidebar-footer">
+          <div class="sidebar-connection"><span class="status-dot" id="connectionDot"></span><span class="sidebar-connection-copy"><strong id="connectionLabel">连接检查中</strong><small>Google Sheets API</small></span></div>
+          <button class="collapse-button" id="collapseSidebar" type="button" aria-expanded="true" aria-label="收起侧边栏"><span aria-hidden="true">‹‹</span><span class="collapse-label">收起菜单</span></button>
+        </div>
+      </aside>
+
+      <main id="main" class="main-content" tabindex="-1">
+        <div class="content-frame">
+          <header class="content-header">
+            <div><p class="eyebrow">情景一 / 渠道日报归集</p><h1 id="pageTitle">今日运行</h1><p class="content-subtitle">查看每日归集状态，确认空值跳过与冲突数据。</p></div>
+            <div class="content-header-actions">
+              <div class="date-field" id="businessDatePicker">
+                <span class="date-caption">业务日期</span>
+                <button class="date-trigger" id="businessDateTrigger" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="businessDatePopover">
+                  <span id="businessDateValue">选择日期</span>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 10h18"/></svg>
+                </button>
+                <input id="businessDate" type="date" tabindex="-1" aria-hidden="true">
+                <div class="date-popover" id="businessDatePopover" role="dialog" aria-label="选择业务日期" hidden>
+                  <div class="date-picker-head">
+                    <button class="date-nav-button" type="button" data-calendar-nav="prev" aria-label="上个月">‹</button>
+                    <strong id="calendarMonthLabel"></strong>
+                    <button class="date-nav-button" type="button" data-calendar-nav="next" aria-label="下个月">›</button>
+                  </div>
+                  <div class="date-weekdays" aria-hidden="true"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div>
+                  <div class="date-grid" id="calendarGrid" role="grid" aria-label="日历"></div>
+                  <div class="date-picker-footer">
+                    <button class="date-text-button" type="button" data-calendar-clear>清除</button>
+                    <button class="date-text-button" type="button" data-calendar-today>今天</button>
+                  </div>
+                </div>
+              </div>
+              <div id="pageAuxActions" class="page-aux-actions" hidden></div>
+              <button class="button secondary" id="rulesButton" type="button" hidden>安全规则</button>
+              <button class="button secondary" id="previewButton"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>预览归集</button>
+              <button class="button primary" id="runButton"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>执行写入</button>
+            </div>
+          </header>
+          <div id="alertRegion" class="alert-region" aria-live="polite"></div>
+          <section id="pageContent" aria-live="polite"></section>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="runDialog" class="dialog">
+    <form method="dialog">
+      <div class="dialog-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2 21h20L12 3Z"/><path d="M12 9v5M12 18h.01"/></svg></div>
+      <h2>确认执行写入</h2>
+      <p id="runDialogText">系统将重新读取所选业务日期，只写入总表中的空白目标单元格。源值为空时跳过，已有不同数值不会覆盖。</p>
+      <div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button class="button primary" id="confirmRun" value="default">确认写入</button></div>
+    </form>
+  </dialog>
+  <dialog id="runDetailDrawer" class="detail-drawer-dialog" aria-labelledby="runDetailDrawerTitle">
+    <div class="detail-drawer-card">
+      <button class="detail-close" id="runDetailDrawerClose" type="button" aria-label="关闭运行详情">×</button>
+      <div class="detail-kicker" id="runDetailDrawerKicker">运行详情</div>
+      <h2 id="runDetailDrawerTitle">处理详情</h2>
+      <p id="runDetailDrawerMeta"></p>
+      <div id="runDetailDrawerBody"></div>
+    </div>
+  </dialog>
+  <dialog id="safetyRulesDialog" class="detail-drawer-dialog config-drawer" aria-labelledby="safetyRulesTitle">
+    <div class="detail-drawer-card">
+      <button class="detail-close" id="safetyRulesClose" type="button" aria-label="关闭安全规则">×</button>
+      <div class="detail-kicker">写入策略</div>
+      <h2 id="safetyRulesTitle">固定安全规则</h2>
+      <ul class="rule-list">
+        <li><span>源值为空：跳过，不清空目标。</span></li>
+        <li><span>数字 0：作为有效数据写入。</span></li>
+        <li><span>目标已有不同值：标记冲突，不覆盖。</span></li>
+        <li><span>重复执行：相同值直接跳过。</span></li>
+      </ul>
+    </div>
+  </dialog>
+    <script type="module" src="/app.js?v=20260817-spend-workspace-1"></script>
+</body>
+</html>
