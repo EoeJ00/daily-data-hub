@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check src/google-sheets.mjs && node --check src/async-utils.mjs && node --check src/collector.mjs && node --check src/scenario2.mjs && node --check src/shelf-pack.mjs && node --check public/spend-history.js && node --check public/app.js",
+    "check": "node --check server.mjs && node --check src/state-store.mjs && node --check src/spreadsheet-utils.mjs && node --check src/scenario2-route.mjs && node --check src/google-sheets.mjs && node --check src/async-utils.mjs && node --check src/collector.mjs && node --check src/scenario2.mjs && node --check src/shelf-pack.mjs && node --check public/api.js && node --check public/scenario-meta.js && node --check public/spend-history.js && node --check public/spend-aggregation.js && node --check public/app.js",
     "test": "node --test"
   },
   "engines": {

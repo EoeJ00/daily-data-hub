@@ -1,4 +1,6 @@
-import { latestSuccessfulResultsByConfiguration } from "./spend-history.js";
+import { api } from "./api.js";
+import { emptyScenarioData, scenarioApi, scenarioDefinitions, scenarioForPage } from "./scenario-meta.js";
+import { shooterBusinessDates as getShooterBusinessDates, shooterSpendRows, spendMetricData, summarizeSpendRows } from "./spend-aggregation.js";
 
 const state = {
   scenarios: {
@@ -44,13 +46,7 @@ const accordionStorageKey = "miulx.scenarioAccordion";
 let activeJobRequest = false;
 
 function scenarioData(scenario = "scenario-1") {
-  return state.scenarios[scenario] || (scenario === "scenario-2"
-    ? { pairs: [], runs: [] }
-    : scenario === "scenario-3" ? { books: [], runs: [] } : { sources: [], runs: [] });
-}
-
-function scenarioApi(scenario, path) {
-  return `/api/scenarios/${scenario}${path}`;
+  return state.scenarios[scenario] || emptyScenarioData(scenario);
 }
 
 function setScenarioAccordion(scenario, open) {
@@ -96,6 +92,10 @@ const icons = {
   lock: icon('<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>'),
   empty: icon('<path d="M4 6h16M7 3h10l1 3H6l1-3ZM6 6l1 15h10l1-15M10 10v7M14 10v7"/>')
 };
+
+function editableNameMarkup(item, label = "编辑工作簿名") {
+  return `<div class="name-display"><strong>${escapeHtml(item.name)}</strong><button class="icon-button" data-edit-name="${escapeHtml(item.id)}" type="button" aria-label="编辑${escapeHtml(item.name)}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.7 4.7L8 20l11-11a2.8 2.8 0 0 0-4-4L4 16Z"/><path d="m13.5 6.5 4 4"/></svg></button></div><input class="inline-input" data-name-input="${escapeHtml(item.id)}" value="${escapeHtml(item.name)}" aria-label="${label}">`;
+}
 
 function formatDate(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
@@ -227,21 +227,14 @@ function initDatePicker() {
 function formatNumber(value) {
   if (value === null || value === undefined || value === "") return "—";
   const number = typeof value === "number" ? value : Number(value);
-  return Number.isFinite(number) ? new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(number) : escapeHtml(value);
+  const formatted = Number.isFinite(number)
+    ? new Intl.NumberFormat("en-US", { maximumFractionDigits: 2, useGrouping: false }).format(number)
+    : escapeHtml(value);
+  return `<span class="numeric-value">${formatted}</span>`;
 }
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[character]);
-}
-
-async function api(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: { "content-type": "application/json", ...options.headers }
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "请求失败");
-  return data;
 }
 
 function notify(message, type = "info") {
@@ -303,10 +296,10 @@ function renderSources() {
       <div class="panel-body config-toolbar"><label class="search-field" for="sourceSearch"><span class="sr-only">搜索工作簿</span><input id="sourceSearch" type="search" placeholder="搜索名称、表格 ID 或目标页签" autocomplete="off"></label><span class="config-count">${primary.sources.length} 个配置</span></div>
     </section>
     <section class="panel">
-      <div class="panel-header"><div><h2>情景一工作簿</h2></div></div>
+      <div class="panel-header"><div><h2>单表工作簿</h2></div></div>
       ${renderSourceTable()}
     </section>
-    <dialog id="sourceImportDrawer" class="detail-drawer-dialog config-drawer" aria-labelledby="sourceImportTitle"><div class="detail-drawer-card"><button class="detail-close" type="button" data-close-source-import aria-label="关闭添加工作簿">×</button><div class="detail-kicker">情景一</div><h2 id="sourceImportTitle">添加工作簿</h2><p>支持批量粘贴链接，每行一个。</p><div class="drawer-form"><label for="linkInput">Google 表格链接<textarea id="linkInput" placeholder="渠道名 | https://docs.google.com/spreadsheets/d/.../edit#gid=0&#10;https://docs.google.com/spreadsheets/d/.../edit?gid=123"></textarea></label><div id="linkPreview" class="paste-preview" aria-live="polite">等待粘贴链接</div><div class="drawer-actions"><button class="button secondary" type="button" data-close-source-import>取消</button><button class="button primary" id="importButton" type="button">${icons.sheet}导入配置</button></div></div></div></dialog>`;
+    <dialog id="sourceImportDrawer" class="detail-drawer-dialog config-drawer" aria-labelledby="sourceImportTitle"><div class="detail-drawer-card"><button class="detail-close" type="button" data-close-source-import aria-label="关闭添加工作簿">×</button><div class="detail-kicker">单表</div><h2 id="sourceImportTitle">添加工作簿</h2><p>支持批量粘贴链接，每行一个。</p><div class="drawer-form"><label>工作簿名<input id="sourceName" placeholder="例如：7W"></label><label for="linkInput">Google 表格链接<textarea id="linkInput" placeholder="渠道名 | https://docs.google.com/spreadsheets/d/.../edit#gid=0&#10;https://docs.google.com/spreadsheets/d/.../edit?gid=123"></textarea></label><div id="linkPreview" class="paste-preview" aria-live="polite">等待粘贴链接</div><div class="drawer-actions"><button class="button secondary" type="button" data-close-source-import>取消</button><button class="button primary" id="importButton" type="button">${icons.sheet}导入配置</button></div></div></div></dialog>`;
   const drawer = content.querySelector("#sourceImportDrawer");
   content.querySelector("[data-open-source-import]")?.addEventListener("click", () => drawer?.showModal());
   content.querySelectorAll("[data-close-source-import]").forEach((button) => button.addEventListener("click", () => drawer?.close()));
@@ -314,37 +307,30 @@ function renderSources() {
   content.querySelector("#linkInput")?.addEventListener("input", (event) => {
     const lines = event.target.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const preview = content.querySelector("#linkPreview");
-    if (preview) preview.textContent = lines.length ? `已识别 ${lines.length} 行链接，提交后自动解析名称与表格 ID。` : "等待粘贴链接";
+    const customName = content.querySelector("#sourceName")?.value.trim();
+    if (preview) preview.textContent = lines.length > 1 && customName ? "批量导入请使用“名称 | 链接”格式；自定义名称仅适用于单个链接。" : lines.length ? `已识别 ${lines.length} 行链接，提交后自动解析名称与表格 ID。` : "等待粘贴链接";
   });
+  content.querySelector("#sourceName")?.addEventListener("input", () => content.querySelector("#linkInput")?.dispatchEvent(new Event("input")));
   content.querySelector("#sourceSearch")?.addEventListener("input", (event) => {
     const query = event.target.value.trim().toLowerCase();
     content.querySelectorAll("[data-search-row]").forEach((row) => { row.hidden = query && !row.dataset.searchRow.includes(query); });
   });
   content.querySelectorAll("[data-toggle]").forEach((button) => button.addEventListener("click", toggleSource));
   content.querySelectorAll("[data-delete]").forEach((button) => button.addEventListener("click", deleteSource));
-  content.querySelectorAll("[data-edit-name]").forEach((button) => button.addEventListener("click", beginEditSource));
-  content.querySelectorAll("[data-name-input]").forEach((input) => {
-    input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") input.blur();
-      if (event.key === "Escape") cancelInlineEdit(input);
-    });
-    input.addEventListener("blur", () => saveInlineName(input));
-  });
+  bindInlineNameEditing();
 }
 
 function renderSourceTable(scenario = "scenario-1") {
   const sources = scenarioData(scenario).sources;
-  const scenarioLabel = "投放统计";
+  const scenarioLabel = "单表";
   const secondColumn = "目标页签";
   if (!sources.length) return `<div class="empty-state">${icons.sheet}<h3>尚未导入工作簿</h3><p>可一次粘贴多个 Google 表格链接，系统会分别建立独立配置。</p></div>`;
   return `<div class="table-wrap"><table><thead><tr><th>工作簿</th><th>${secondColumn}</th><th>情景</th><th>启用</th><th><span class="sr-only">操作</span></th></tr></thead><tbody>${sources.map((source) => `
-    <tr data-search-row="${escapeHtml(`${source.name} ${source.spreadsheetId || ""} ${source.targetSheet || ""}`.toLowerCase())}"><td class="name-cell source-row" data-source-row="${source.id}"><div class="name-display"><strong>${escapeHtml(source.name)}</strong><button class="icon-button" data-edit-name="${source.id}" type="button" aria-label="编辑${escapeHtml(source.name)}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.7 4.7L8 20l11-11a2.8 2.8 0 0 0-4-4L4 16Z"/><path d="m13.5 6.5 4 4"/></svg></button></div><input class="inline-input" data-name-input="${source.id}" value="${escapeHtml(source.name)}" aria-label="编辑工作簿名"><small class="name-url">${escapeHtml(source.spreadsheetId || source.url)}</small></td><td>${escapeHtml(source.targetSheet || "—")}</td><td><span class="badge neutral">${scenarioLabel}</span></td><td><button class="toggle ${source.enabled ? "on" : ""}" data-toggle="${source.id}" role="switch" aria-checked="${source.enabled}" aria-label="${source.enabled ? "停用" : "启用"}${escapeHtml(source.name)}"></button></td><td><div class="actions"><a class="button small secondary" href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">打开</a><button class="button small danger" data-delete="${source.id}">移除</button></div></td></tr>`).join("")}</tbody></table></div>`;
+    <tr data-search-row="${escapeHtml(`${source.name} ${source.spreadsheetId || ""} ${source.targetSheet || ""}`.toLowerCase())}"><td class="name-cell source-row" data-source-row="${source.id}" data-name-row data-name-scenario="scenario-1" data-name-collection="sources" data-name-key="source">${editableNameMarkup(source)}<small class="name-url">${escapeHtml(source.spreadsheetId || source.url)}</small></td><td>${escapeHtml(source.targetSheet || "—")}</td><td><span class="badge neutral">${scenarioLabel}</span></td><td><button class="toggle ${source.enabled ? "on" : ""}" data-toggle="${source.id}" role="switch" aria-checked="${source.enabled}" aria-label="${source.enabled ? "停用" : "启用"}${escapeHtml(source.name)}"></button></td><td><div class="actions"><a class="button small secondary" href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">打开</a><button class="button small danger" data-delete="${source.id}">移除</button></div></td></tr>`).join("")}</tbody></table></div>`;
 }
 
 function shooterBusinessDates() {
-  return [...new Set(["scenario-1", "scenario-2"].flatMap((scenario) => scenarioData(scenario).runs
-    .filter((run) => run.businessDate && run.results?.some((result) => result.status === "success" && result.rows?.some(spendEntry)))
-    .map((run) => String(run.businessDate))))].sort((a, b) => b.localeCompare(a));
+  return getShooterBusinessDates(state.scenarios);
 }
 
 function shooterDatePickerMarkup(value) {
@@ -394,91 +380,6 @@ function initStandaloneDatePicker() {
     ariaLabel: "统计日期",
     onValueChange: (value) => { state.shooterDate = value; render(); }
   });
-}
-
-function spendEntry(row) {
-  const metricName = String(row.metric || "");
-  const metric = /回流/.test(metricName) ? "returnSpend" : /消耗/.test(metricName) ? "spend" : "";
-  if (!metric || row.status === "error" || row.status === "blank" || row.sourceValue === undefined || row.sourceValue === null || row.sourceValue === "") return null;
-  const value = Number(row.sourceValue);
-  return Number.isFinite(value) ? { metric, value } : null;
-}
-
-function displayShooter(row) {
-  const target = String(row.targetSheet || "").match(/\(([^()]*)\)\s*$/);
-  const channel = String(row.channel || "").match(/\(([^()]*)\)\s*$/);
-  const value = row.shooter || target?.[1] || channel?.[1] || "未标注";
-  return String(value).trim().toUpperCase();
-}
-
-function displayChain(row) {
-  const channel = String(row.channel || "").replace(/\s*\([^()]*\)\s*$/, "").trim();
-  return row.routeKey || row.targetChannel || channel || row.routeCode || "未识别";
-}
-
-function displayChannelGroup(result, scenario) {
-  const scenario2 = scenario === "scenario-2";
-  const configurations = scenario2 ? scenarioData(scenario).pairs : scenarioData(scenario).sources;
-  const configurationId = scenario2 ? result.pairId : result.sourceId;
-  const snapshotName = scenario2 ? result.pairName : result.sourceName;
-  const configured = configurationId
-    ? configurations.find((item) => item.id === configurationId)
-    : configurations.find((item) => String(item.name).trim() === String(snapshotName || "").trim());
-  return String(configured?.name || "").trim();
-}
-
-function latestDataResults(scenario, businessDate = "") {
-  const scenario2 = scenario === "scenario-2";
-  return latestSuccessfulResultsByConfiguration(scenarioData(scenario).runs, {
-    businessDate,
-    configurationKey: (result) => (scenario2 ? result.pairId : result.sourceId) || displayChannelGroup(result, scenario),
-    hasSpendData: (result) => result.rows?.some(spendEntry)
-  });
-}
-
-function shooterSpendRows(businessDate = "") {
-  const snapshots = ["scenario-1", "scenario-2"].flatMap((scenario) =>
-    latestDataResults(scenario, businessDate).map(({ run, result }) => ({ scenario, run, result }))
-  );
-  const runs = [...new Map(snapshots.map(({ run }) => [run.id, run])).values()];
-  const groups = new Map();
-  for (const { scenario, result } of snapshots) {
-    const channelGroup = displayChannelGroup(result, scenario);
-    if (!channelGroup) continue;
-    for (const row of result.rows || []) {
-      const entry = spendEntry(row);
-      if (!entry) continue;
-      const chain = displayChain(row);
-      if (!chain || chain === "未识别") continue;
-      const shooter = displayShooter(row);
-      const key = `${channelGroup}\u0000${shooter}\u0000${chain}`;
-      const current = groups.get(key) || { channelGroup, shooter, chain, spend: 0, returnSpend: 0 };
-      current[entry.metric] += entry.value;
-      groups.set(key, current);
-    }
-  }
-  return { runs, rows: [...groups.values()].sort((a, b) => a.shooter.localeCompare(b.shooter, "zh-CN") || a.chain.localeCompare(b.chain, "zh-CN", { numeric: true })) };
-}
-
-function summarizeSpendRows(rows, key) {
-  const groups = new Map();
-  for (const row of rows) {
-    const groupKey = row[key];
-    const current = groups.get(groupKey) || { [key]: groupKey, spend: 0, returnSpend: 0, details: [] };
-    current.spend += row.spend;
-    current.returnSpend += row.returnSpend;
-    current.details.push(row);
-    groups.set(groupKey, current);
-  }
-  return [...groups.values()]
-    .map((group) => ({ ...group, total: group.spend + group.returnSpend }))
-    .sort((a, b) => b.total - a.total || String(a[key]).localeCompare(String(b[key]), "zh-CN", { numeric: true }));
-}
-
-function spendMetricData(rows, runs) {
-  const spend = rows.reduce((sum, row) => sum + row.spend, 0);
-  const returnSpend = rows.reduce((sum, row) => sum + row.returnSpend, 0);
-  return { spend, returnSpend, total: spend + returnSpend, rows, runs };
 }
 
 function spendSummaryMarkup(entityLabel, entityCount, data) {
@@ -535,11 +436,11 @@ function bindSpendDetail(kind, summaries) {
 
 function renderChannelSpendPanel() {
   const selectedDate = selectedShooterDate();
-  const source = shooterSpendRows(selectedDate);
+  const source = shooterSpendRows(state.scenarios, selectedDate);
   const data = spendMetricData(source.rows, source.runs);
   const dates = recentDateRange(selectedDate);
   const dailySummaries = dates.map((businessDate) => {
-    const dailySource = shooterSpendRows(businessDate);
+    const dailySource = shooterSpendRows(state.scenarios, businessDate);
     const summaries = summarizeSpendRows(dailySource.rows, "channelGroup").map((summary) => ({
       ...summary,
       businessDate,
@@ -563,7 +464,7 @@ function renderChannelSpendPanel() {
 
 function renderShooterPanel() {
   const selectedDate = selectedShooterDate();
-  const source = shooterSpendRows(selectedDate);
+  const source = shooterSpendRows(state.scenarios, selectedDate);
   const data = spendMetricData(source.rows, source.runs);
   const shooterTotals = summarizeSpendRows(data.rows, "shooter").map((summary) => {
     const channels = summarizeSpendRows(summary.details, "channelGroup");
@@ -573,7 +474,7 @@ function renderShooterPanel() {
   const empty = `<div class="empty-state">${icons.empty}<h3>暂无投手消耗数据</h3></div>`;
   const body = shooterTotals.length ? `<div class="table-wrap shooter-spend-wrap"><table class="shooter-spend-table"><thead><tr><th>投手</th><th>所在渠道</th><th>链数</th><th>消耗</th><th>回流消耗</th><th>总消耗</th></tr></thead><tbody>${shooterTotals.map((summary) => {
     const searchText = `${summary.shooter} ${summary.channels.map((channel) => channel.channelGroup).join(" ")} ${summary.details.map((row) => row.chain).join(" ")}`.toLowerCase();
-    return `<tr data-spend-search-row="${escapeHtml(searchText)}"><td><button class="shooter-row-trigger" type="button" data-shooter-open="${escapeHtml(summary.shooter)}" aria-haspopup="dialog"><span class="shooter-avatar" aria-hidden="true">${escapeHtml(summary.shooter.slice(0, 1))}</span><span class="shooter-row-copy"><strong>${escapeHtml(summary.shooter)}</strong></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg></button></td><td><div class="channel-token-list">${summary.channels.map((channel) => `<span class="channel-token">${escapeHtml(channel.channelGroup)}</span>`).join("")}</div></td><td class="numeric-cell">${summary.chainCount}</td><td class="numeric-cell">${formatNumber(summary.spend)}</td><td class="numeric-cell">${formatNumber(summary.returnSpend)}</td><td class="numeric-cell total-cell">${formatNumber(summary.total)}</td></tr>`;
+    return `<tr data-spend-search-row="${escapeHtml(searchText)}"><td><button class="shooter-row-trigger" type="button" data-shooter-open="${escapeHtml(summary.shooter)}" aria-haspopup="dialog"><span class="shooter-avatar">${escapeHtml(summary.shooter)}</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg></button></td><td><div class="channel-token-list">${summary.channels.map((channel) => `<span class="channel-token">${escapeHtml(channel.channelGroup)}</span>`).join("")}</div></td><td class="numeric-cell">${summary.chainCount}</td><td class="numeric-cell">${formatNumber(summary.spend)}</td><td class="numeric-cell">${formatNumber(summary.returnSpend)}</td><td class="numeric-cell total-cell">${formatNumber(summary.total)}</td></tr>`;
   }).join("")}<tr class="spend-filter-empty" hidden><td colspan="6">没有匹配的投手、渠道或链名</td></tr></tbody></table></div>` : empty;
   content.innerHTML = `${spendSummaryMarkup("投手", shooterTotals.length, data)}<section class="panel spend-panel"><div class="panel-header spend-panel-header"><div><h2>投手当日消耗</h2></div>${shooterTotals.length ? `<label class="spend-search"><span class="sr-only">搜索投手、渠道或链名</span><input type="search" placeholder="搜索投手、渠道或链名" autocomplete="off"></label>` : ""}</div>${body}</section>${spendDetailDialogMarkup("shooter")}`;
   const searchInput = content.querySelector(".spend-search input");
@@ -592,50 +493,68 @@ function renderShooterPanel() {
   bindSpendDetail("shooter", shooterTotals);
 }
 
-function beginEditSource(event) {
-  const row = event.currentTarget.closest("[data-source-row]");
-  const input = row.querySelector("[data-name-input]");
+function editableNameContext(input) {
+  const row = input.closest("[data-name-row]");
+  if (!row) return null;
+  const scenario = row.dataset.nameScenario || "scenario-1";
+  const collection = row.dataset.nameCollection || "sources";
+  const itemKey = row.dataset.nameKey || ({ sources: "source", pairs: "pair", books: "book" }[collection] || "item");
+  const item = scenarioData(scenario)[collection]?.find((candidate) => candidate.id === input.dataset.nameInput);
+  return { row, scenario, collection, itemKey, item };
+}
+
+function bindInlineNameEditing(container = content) {
+  container.querySelectorAll("[data-edit-name]").forEach((button) => button.addEventListener("click", beginEditName));
+  container.querySelectorAll("[data-name-input]").forEach((input) => {
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") input.blur();
+      if (event.key === "Escape") cancelInlineEdit(input);
+    });
+    input.addEventListener("blur", () => saveInlineName(input));
+  });
+}
+
+function beginEditName(event) {
+  const row = event.currentTarget.closest("[data-name-row]");
+  const input = row?.querySelector("[data-name-input]");
+  if (!row || !input) return;
   row.classList.add("inline-editing");
   input.focus();
   input.select();
 }
 
 function cancelInlineEdit(input) {
-  const source = scenarioData("scenario-1").sources.find((item) => item.id === input.dataset.nameInput);
-  input.value = source?.name || input.value;
-  input.closest("[data-source-row]")?.classList.remove("inline-editing");
+  const context = editableNameContext(input);
+  if (!context) return;
+  input.value = context.item?.name || input.value;
+  context.row.classList.remove("inline-editing");
 }
 
 async function saveInlineName(input) {
-  const row = input.closest("[data-source-row]");
-  if (!row?.classList.contains("inline-editing")) return;
-  const source = scenarioData("scenario-1").sources.find((item) => item.id === input.dataset.nameInput);
+  const context = editableNameContext(input);
+  if (!context?.row.classList.contains("inline-editing")) return;
+  const { row, scenario, collection, itemKey, item } = context;
   const name = input.value.trim();
-  if (!source) return;
+  if (!item) return;
   if (!name) {
     notify("工作簿名不能为空", "error");
-    input.value = source.name;
+    input.value = item.name;
     row.classList.remove("inline-editing");
     return;
   }
-  if (name === source.name) {
+  if (name === item.name) {
     row.classList.remove("inline-editing");
     return;
   }
   try {
-    const data = await api(scenarioApi("scenario-1", `/sources/${source.id}`), { method: "PATCH", body: JSON.stringify({ name }) });
-    Object.assign(source, data.source);
+    const data = await api(scenarioApi(scenario, `/${collection}/${item.id}`), { method: "PATCH", body: JSON.stringify({ name }) });
+    Object.assign(item, data[itemKey]);
     notify("工作簿名已更新");
-    renderSources();
+    render();
   } catch (error) {
     notify(error.message, "error");
     row.classList.remove("inline-editing");
   }
-}
-
-function renderRuns() {
-  const runs = scenarioData("scenario-1").runs;
-  content.innerHTML = `<section class="panel"><div class="panel-header"><div><h2>情景一运行日志</h2><p>保留最近 50 次预览和正式写入记录</p></div></div>${runs.length ? `<div class="table-wrap"><table><thead><tr><th>时间</th><th>类型</th><th>业务日期</th><th>工作簿</th><th>空值跳过</th><th>冲突</th><th>异常</th></tr></thead><tbody>${runs.map((run) => `<tr><td>${new Date(run.createdAt).toLocaleString("zh-CN")}</td><td>${run.type === "run" ? badge("written") : badge("ready")}</td><td>${run.businessDate}</td><td>${run.summary.workbooks}</td><td>${run.summary.blankSkipped}</td><td>${run.summary.conflicts}</td><td>${run.summary.errors}</td></tr>`).join("")}</tbody></table></div>` : `<div class="empty-state">${icons.empty}<h3>暂无运行记录</h3><p>预览和正式写入都会在这里留下可追溯记录。</p></div>`}</section>`;
 }
 
 function classifyError(message) {
@@ -667,7 +586,7 @@ function errorGuidance(category) {
 function openRunDetail(scenario, run) {
   if (!runDetailDrawer) return;
   const summary = run.summary || {};
-  runDetailDrawerKicker.textContent = scenario === "scenario-2" ? "情景二 · 运行详情" : scenario === "scenario-3" ? "架上包 · 运行详情" : "情景一 · 运行详情";
+  runDetailDrawerKicker.textContent = scenario === "scenario-2" ? "多表匹配 · 运行详情" : scenario === "scenario-3" ? "架上包 · 运行详情" : "单表 · 运行详情";
   runDetailDrawerTitle.textContent = run.type === "run" ? "正式写入" : "预览归集";
   const category = runStatus(run) === "error" ? classifyError(run.error || run.results?.find((item) => item.error)?.error) : "";
   runDetailDrawerMeta.textContent = String(run.businessDate || "未设置日期") + " · " + new Date(run.createdAt).toLocaleString("zh-CN") + " · " + (category || "处理完成");
@@ -676,7 +595,7 @@ function openRunDetail(scenario, run) {
   runDetailDrawer.showModal();
 }
 
-function renderRunsModern(scenario = "scenario-1") {
+function renderRuns(scenario = "scenario-1") {
   const filters = state.logFilters;
   const allRuns = scenarioData(scenario).runs || [];
   const runs = allRuns.filter((run) => {
@@ -692,14 +611,14 @@ function renderRunsModern(scenario = "scenario-1") {
     const category = status === "error" ? classifyError(run.error || run.results?.find((item) => item.error)?.error) : "—";
     return '<tr><td>' + escapeHtml(new Date(run.createdAt).toLocaleString("zh-CN")) + '</td><td>' + escapeHtml(run.businessDate || "—") + '</td><td>' + (run.type === "run" ? badge("written") : badge("ready")) + '</td><td>' + formatNumber(summary.workbooks || summary.pairs || 0) + '</td><td>' + formatNumber((summary.written || 0) + (summary.ready || 0)) + '</td><td>' + formatNumber(summary.conflicts || 0) + '</td><td>' + (status === "error" ? badge("error") : '<span class="badge neutral">正常</span>') + '</td><td><button class="log-row-trigger" type="button" data-log-detail="' + escapeHtml(scenario + ":" + run.id) + '">查看详情</button><span class="log-category">' + escapeHtml(category) + '</span></td></tr>';
   }).join("");
-  const scenarioLabel = scenario === "scenario-2" ? "情景二" : scenario === "scenario-3" ? "架上包" : "情景一";
-  content.innerHTML = '<section class="panel"><div class="panel-header"><div><h2>' + scenarioLabel + '运行日志</h2></div></div><div class="log-toolbar"><label>模块<select data-log-filter="scenario"><option value="scenario-1">情景一</option><option value="scenario-2">情景二</option><option value="scenario-3">架上包</option></select></label><label>日期<input type="date" data-log-filter="date" value="' + escapeHtml(filters.date) + '"></label><label>状态<select data-log-filter="status"><option value="all">全部状态</option><option value="ready">待写入</option><option value="written">已写入</option><option value="error">异常</option></select></label><label>类型<select data-log-filter="type"><option value="all">全部类型</option><option value="preview">预览</option><option value="written">正式写入</option></select></label></div>' + (runs.length ? '<div class="table-wrap"><table><thead><tr><th>时间</th><th>业务日期</th><th>类型</th><th>工作簿</th><th>处理项</th><th>冲突</th><th>状态</th><th>详情</th></tr></thead><tbody>' + rows + '</tbody></table></div>' : '<div class="empty-state">' + icons.empty + '<h3>暂无符合条件的记录</h3></div>') + '</section>';
-  content.querySelector('[data-log-filter="date"]').addEventListener("change", (event) => { state.logFilters.date = event.target.value; renderRunsModern(scenario); });
+  const scenarioLabel = scenario === "scenario-2" ? "多表匹配" : scenario === "scenario-3" ? "架上包" : "单表";
+  content.innerHTML = '<section class="panel"><div class="panel-header"><div><h2>' + scenarioLabel + '运行日志</h2></div></div><div class="log-toolbar"><label>模块<select data-log-filter="scenario"><option value="scenario-1">单表</option><option value="scenario-2">多表匹配</option><option value="scenario-3">架上包</option></select></label><label>日期<input type="date" data-log-filter="date" value="' + escapeHtml(filters.date) + '"></label><label>状态<select data-log-filter="status"><option value="all">全部状态</option><option value="ready">待写入</option><option value="written">已写入</option><option value="error">异常</option></select></label><label>类型<select data-log-filter="type"><option value="all">全部类型</option><option value="preview">预览</option><option value="written">正式写入</option></select></label></div>' + (runs.length ? '<div class="table-wrap"><table><thead><tr><th>时间</th><th>业务日期</th><th>类型</th><th>工作簿</th><th>处理项</th><th>冲突</th><th>状态</th><th>详情</th></tr></thead><tbody>' + rows + '</tbody></table></div>' : '<div class="empty-state">' + icons.empty + '<h3>暂无符合条件的记录</h3></div>') + '</section>';
+  content.querySelector('[data-log-filter="date"]').addEventListener("change", (event) => { state.logFilters.date = event.target.value; renderRuns(scenario); });
   content.querySelector('[data-log-filter="status"]').value = filters.status;
   content.querySelector('[data-log-filter="type"]').value = filters.type;
   content.querySelector('[data-log-filter="scenario"]').value = scenario;
   content.querySelector('[data-log-filter="scenario"]').addEventListener("change", (event) => { state.page = event.target.value === "scenario-2" ? "scenario2-runs" : event.target.value === "scenario-3" ? "scenario3-runs" : "runs"; render(); });
-  content.querySelectorAll('[data-log-filter="status"], [data-log-filter="type"]').forEach((control) => control.addEventListener("change", (event) => { state.logFilters[control.dataset.logFilter] = event.target.value; renderRunsModern(scenario); }));
+  content.querySelectorAll('[data-log-filter="status"], [data-log-filter="type"]').forEach((control) => control.addEventListener("change", (event) => { state.logFilters[control.dataset.logFilter] = event.target.value; renderRuns(scenario); }));
   content.querySelectorAll("[data-log-detail]").forEach((button) => button.addEventListener("click", () => {
     const [targetScenario, id] = button.dataset.logDetail.split(":");
     const run = scenarioData(targetScenario).runs.find((item) => item.id === id);
@@ -730,11 +649,11 @@ function renderScenario2Overview() {
       ${metric("冲突与异常", (summary.conflicts || 0) + (summary.errors || 0), "歧义、缺日期和已有值均不覆盖")}
     </div>
     <section class="panel">
-      <div class="panel-header"><div><h2>最近一次情景二处理结果</h2><p>${latest ? `${latest.businessDate} · ${latest.type === "run" ? "正式写入" : "预览"}` : "尚未执行任务"}</p></div>${latest ? `<span class="badge neutral">${new Date(latest.createdAt).toLocaleString("zh-CN")}</span>` : ""}</div>
+      <div class="panel-header"><div><h2>最近一次多表匹配处理结果</h2><p>${latest ? `${latest.businessDate} · ${latest.type === "run" ? "正式写入" : "预览"}` : "尚未执行任务"}</p></div>${latest ? `<span class="badge neutral">${new Date(latest.createdAt).toLocaleString("zh-CN")}</span>` : ""}</div>
       ${latest ? renderScenario2RunDetails(latest) : `<div class="empty-state">${icons.sheet}<h3>等待首次预览</h3><p>选择业务日期后先预览，核对渠道编号、投手页签、日期行以及两级目标单元格。</p></div>`}
     </section>
     <section class="panel safety-rules-panel" hidden>
-      <div class="panel-header"><div><h2>固定安全规则</h2><p>情景二按配对独立处理，先写投手日报，再复核总表</p></div></div>
+      <div class="panel-header"><div><h2>固定安全规则</h2><p>多表匹配按配对独立处理，先写投手日报，再复核总表</p></div></div>
       <div class="panel-body"><ul class="rule-list">
         <li>${icons.check}<span><strong>源值为空：</strong>跳过该指标，不写入数值，不清空目标已有值。</span></li>
         <li>${icons.check}<span><strong>目标有不同值：</strong>标记冲突，不自动覆盖。</span></li>
@@ -744,36 +663,15 @@ function renderScenario2Overview() {
   content.querySelectorAll("[data-run-detail]").forEach((row) => row.addEventListener("click", () => { const run = secondary.runs.find((item) => item.id === row.dataset.runDetail); if (run) openRunDetail("scenario-2", run); }));
 }
 
-function renderScenario2Config() {
-  const secondary = scenarioData("scenario-2");
-  content.innerHTML = `
-    <section class="panel">
-      <div class="panel-header"><div><h2>新增日报配对</h2><p>甲方日报与自己的日报表必须一一对应</p></div></div>
-      <div class="panel-body pair-form">
-        <label>配对名称<input id="pairName" placeholder="例如：RS9"></label>
-        <label>甲方日报链接<input id="clientUrl" placeholder="https://docs.google.com/spreadsheets/d/..."></label>
-        <label>自己的日报链接<input id="ownUrl" placeholder="https://docs.google.com/spreadsheets/d/..."></label>
-        <button class="button primary" id="addPairButton">${icons.sheet}添加配对</button>
-      </div>
-    </section>
-    <section class="panel">
-      <div class="panel-header"><div><h2>工作簿配对</h2><p>完整链名可以变化，系统以配对内唯一渠道编号为主键</p></div></div>
-      ${renderPairTable(secondary.pairs)}
-    </section>`;
-  document.querySelector("#addPairButton").addEventListener("click", addPair);
-  content.querySelectorAll("[data-pair-toggle]").forEach((button) => button.addEventListener("click", togglePair));
-  content.querySelectorAll("[data-pair-delete]").forEach((button) => button.addEventListener("click", deletePair));
-}
-
 function renderPairCards(pairs) {
   if (!pairs.length) return '<div class="empty-state">' + icons.sheet + '<h3>尚未配置日报配对</h3></div>';
-  return '<div class="pair-card-list">' + pairs.map((pair) => '<article class="pair-card" data-search-row="' + escapeHtml((pair.name + " " + (pair.client?.spreadsheetId || "") + " " + (pair.own?.spreadsheetId || "")).toLowerCase()) + '"><div><strong>' + escapeHtml(pair.name) + '</strong><div class="pair-card-links"><a class="table-link" href="' + escapeHtml(pair.client.url) + '" target="_blank" rel="noreferrer">甲方日报 · ' + escapeHtml(pair.client.name) + '</a><a class="table-link" href="' + escapeHtml(pair.own.url) + '" target="_blank" rel="noreferrer">自己的日报 · ' + escapeHtml(pair.own.name) + '</a><span>识别模式 · 逐链页签</span></div></div><div class="pair-card-actions"><span class="badge ' + (pair.enabled ? "" : "neutral") + '">' + (pair.enabled ? "已启用" : "已停用") + '</span><button class="toggle ' + (pair.enabled ? "on" : "") + '" data-pair-toggle="' + pair.id + '" role="switch" aria-checked="' + pair.enabled + '" aria-label="' + (pair.enabled ? "停用" : "启用") + escapeHtml(pair.name) + '"></button><button class="button small danger" data-pair-delete="' + pair.id + '">移除</button></div></article>').join("") + '</div>';
+  return `<div class="pair-card-list">${pairs.map((pair) => `<article class="pair-card" data-search-row="${escapeHtml((pair.name + " " + (pair.client?.spreadsheetId || "") + " " + (pair.own?.spreadsheetId || "")).toLowerCase())}" data-name-row data-name-scenario="scenario-2" data-name-collection="pairs" data-name-key="pair"><div>${editableNameMarkup(pair, "编辑配对名称")}<div class="pair-card-links"><a class="table-link" href="${escapeHtml(pair.client.url)}" target="_blank" rel="noreferrer">甲方日报 · ${escapeHtml(pair.client.name)}</a><a class="table-link" href="${escapeHtml(pair.own.url)}" target="_blank" rel="noreferrer">自己的日报 · ${escapeHtml(pair.own.name)}</a><span>识别模式 · 逐链页签</span></div></div><div class="pair-card-actions"><span class="badge ${pair.enabled ? "" : "neutral"}">${pair.enabled ? "已启用" : "已停用"}</span><button class="toggle ${pair.enabled ? "on" : ""}" data-pair-toggle="${pair.id}" role="switch" aria-checked="${pair.enabled}" aria-label="${pair.enabled ? "停用" : "启用"}${escapeHtml(pair.name)}"></button><button class="button small danger" data-pair-delete="${pair.id}">移除</button></div></article>`).join("")}</div>`;
 }
 
-function renderScenario2ConfigModern() {
+function renderScenario2Config() {
   const secondary = scenarioData("scenario-2");
-  const drawerMarkup = '<dialog id="pairImportDrawer" class="detail-drawer-dialog config-drawer" aria-labelledby="pairImportTitle"><div class="detail-drawer-card"><button class="detail-close" type="button" data-close-pair-import aria-label="关闭添加配对">×</button><div class="detail-kicker">情景二</div><h2 id="pairImportTitle">添加日报配对</h2><p>为每个甲方日报配置一张自己的日报。</p><div class="drawer-form"><label>配对名称<input id="pairName" placeholder="例如：RS9"></label><label>甲方日报链接<input id="clientUrl" placeholder="https://docs.google.com/spreadsheets/d/..."></label><label>自己的日报链接<input id="ownUrl" placeholder="https://docs.google.com/spreadsheets/d/..."></label><div class="drawer-actions"><button class="button secondary" type="button" data-close-pair-import>取消</button><button class="button primary" id="addPairButton" type="button">' + icons.sheet + '添加配对</button></div></div></div></dialog>';
-  content.innerHTML = '<section class="panel"><div class="panel-header"><div><h2>工作簿配置</h2></div><button class="button primary" type="button" data-open-pair-import>' + icons.sheet + '添加配对</button></div><div class="panel-body config-toolbar"><label class="search-field" for="pairSearch"><span class="sr-only">搜索配对</span><input id="pairSearch" type="search" placeholder="搜索配对名称或表格 ID" autocomplete="off"></label><span class="config-count">' + secondary.pairs.length + ' 组配对</span></div></section><section class="panel"><div class="panel-header"><div><h2>情景二日报配对</h2></div></div>' + renderPairCards(secondary.pairs) + '</section>' + drawerMarkup;
+  const drawerMarkup = '<dialog id="pairImportDrawer" class="detail-drawer-dialog config-drawer" aria-labelledby="pairImportTitle"><div class="detail-drawer-card"><button class="detail-close" type="button" data-close-pair-import aria-label="关闭添加配对">×</button><div class="detail-kicker">多表匹配</div><h2 id="pairImportTitle">添加日报配对</h2><p>为每个甲方日报配置一张自己的日报。</p><div class="drawer-form"><label>配对名称<input id="pairName" placeholder="例如：RS9"></label><label>甲方日报链接<input id="clientUrl" placeholder="https://docs.google.com/spreadsheets/d/..."></label><label>自己的日报链接<input id="ownUrl" placeholder="https://docs.google.com/spreadsheets/d/..."></label><div class="drawer-actions"><button class="button secondary" type="button" data-close-pair-import>取消</button><button class="button primary" id="addPairButton" type="button">' + icons.sheet + '添加配对</button></div></div></div></dialog>';
+  content.innerHTML = '<section class="panel"><div class="panel-header"><div><h2>工作簿配置</h2></div><button class="button primary" type="button" data-open-pair-import>' + icons.sheet + '添加配对</button></div><div class="panel-body config-toolbar"><label class="search-field" for="pairSearch"><span class="sr-only">搜索配对</span><input id="pairSearch" type="search" placeholder="搜索配对名称或表格 ID" autocomplete="off"></label><span class="config-count">' + secondary.pairs.length + ' 组配对</span></div></section><section class="panel"><div class="panel-header"><div><h2>多表匹配日报配对</h2></div></div>' + renderPairCards(secondary.pairs) + '</section>' + drawerMarkup;
   const drawer = content.querySelector("#pairImportDrawer");
   content.querySelector("[data-open-pair-import]")?.addEventListener("click", () => drawer?.showModal());
   content.querySelectorAll("[data-close-pair-import]").forEach((button) => button.addEventListener("click", () => drawer?.close()));
@@ -784,6 +682,7 @@ function renderScenario2ConfigModern() {
   });
   content.querySelectorAll("[data-pair-toggle]").forEach((button) => button.addEventListener("click", togglePair));
   content.querySelectorAll("[data-pair-delete]").forEach((button) => button.addEventListener("click", deletePair));
+  bindInlineNameEditing();
 }
 
 function renderShelfRunDetails(run) {
@@ -811,7 +710,7 @@ function renderScenario3Overview() {
 
 function renderShelfBookCards(books) {
   if (!books.length) return `<div class="empty-state">${icons.empty}<h3>尚未配置架上包工作簿</h3></div>`;
-  return `<div class="pair-card-list">${books.map((book) => `<article class="pair-card" data-search-row="${escapeHtml(`${book.name} ${book.spreadsheetId || ""}`.toLowerCase())}"><div><strong>${escapeHtml(book.name)}</strong><div class="pair-card-links"><a class="table-link" href="${escapeHtml(book.url)}" target="_blank" rel="noreferrer">打开 Google 表格</a><span>自动识别架上包表与投手消耗表</span></div></div><div class="pair-card-actions"><span class="badge ${book.enabled ? "" : "neutral"}">${book.enabled ? "已启用" : "已停用"}</span><button class="toggle ${book.enabled ? "on" : ""}" data-shelf-toggle="${escapeHtml(book.id)}" role="switch" aria-checked="${book.enabled}" aria-label="${book.enabled ? "停用" : "启用"}${escapeHtml(book.name)}"></button><button class="button small danger" data-shelf-delete="${escapeHtml(book.id)}">移除</button></div></article>`).join("")}</div>`;
+  return `<div class="pair-card-list">${books.map((book) => `<article class="pair-card" data-search-row="${escapeHtml(`${book.name} ${book.spreadsheetId || ""}`.toLowerCase())}" data-name-row data-name-scenario="scenario-3" data-name-collection="books" data-name-key="book"><div>${editableNameMarkup(book)}<div class="pair-card-links"><a class="table-link" href="${escapeHtml(book.url)}" target="_blank" rel="noreferrer">打开 Google 表格</a><span>自动识别架上包表与投手消耗表</span></div></div><div class="pair-card-actions"><span class="badge ${book.enabled ? "" : "neutral"}">${book.enabled ? "已启用" : "已停用"}</span><button class="toggle ${book.enabled ? "on" : ""}" data-shelf-toggle="${escapeHtml(book.id)}" role="switch" aria-checked="${book.enabled}" aria-label="${book.enabled ? "停用" : "启用"}${escapeHtml(book.name)}"></button><button class="button small danger" data-shelf-delete="${escapeHtml(book.id)}">移除</button></div></article>`).join("")}</div>`;
 }
 
 function renderScenario3Config() {
@@ -828,6 +727,7 @@ function renderScenario3Config() {
   });
   content.querySelectorAll("[data-shelf-toggle]").forEach((button) => button.addEventListener("click", toggleShelfBook));
   content.querySelectorAll("[data-shelf-delete]").forEach((button) => button.addEventListener("click", deleteShelfBook));
+  bindInlineNameEditing();
 }
 
 function renderChannel(row) {
@@ -845,15 +745,15 @@ function render() {
   const pages = {
     overview: { title: "今日运行", render: renderOverview },
     sources: { title: "工作簿配置", render: renderSources },
-    runs: { title: "运行日志", render: () => renderRunsModern("scenario-1") },
+    runs: { title: "运行日志", render: () => renderRuns("scenario-1") },
     channels: { title: "渠道消耗", render: renderChannelSpendPanel },
     shooters: { title: "投手消耗", render: renderShooterPanel },
     "scenario2-overview": { title: "今日运行", render: renderScenario2Overview },
-    "scenario2-config": { title: "工作簿配置", render: renderScenario2ConfigModern },
-    "scenario2-runs": { title: "运行日志", render: () => renderRunsModern("scenario-2") },
+    "scenario2-config": { title: "工作簿配置", render: renderScenario2Config },
+    "scenario2-runs": { title: "运行日志", render: () => renderRuns("scenario-2") },
     "scenario3-overview": { title: "今日运行", render: renderScenario3Overview },
     "scenario3-config": { title: "工作簿配置", render: renderScenario3Config },
-    "scenario3-runs": { title: "运行日志", render: () => renderRunsModern("scenario-3") }
+    "scenario3-runs": { title: "运行日志", render: () => renderRuns("scenario-3") }
   };
   const page = pages[state.page] || pages.overview;
   const secondary = state.page.startsWith("scenario2");
@@ -862,18 +762,18 @@ function render() {
   const standalonePage = state.page === "channels" || shooterPage;
   const runPage = state.page === "overview" || state.page === "scenario2-overview" || state.page === "scenario3-overview";
   pageTitle.textContent = page.title;
-  topWorkspaceLabel.textContent = standalonePage ? "独立统计工作台" : secondary ? "配对日报工作台" : shelf ? "架上包工作台" : "投放统计工作台";
+  topWorkspaceLabel.textContent = standalonePage ? "独立统计工作台" : secondary ? "多表匹配工作台" : shelf ? "架上包工作台" : "单表工作台";
   document.querySelector(".eyebrow").textContent = standalonePage
     ? `独立统计 / ${shooterPage ? "投手消耗" : "渠道消耗"}`
     : secondary
-      ? (state.page === "scenario2-overview" ? "情景二 / 配对日报归集" : "情景二 / 工作簿配置")
+      ? (state.page === "scenario2-overview" ? "多表匹配 / 配对日报归集" : "多表匹配 / 工作簿配置")
       : shelf
         ? (state.page === "scenario3-overview" ? "架上包 / 投手消耗搬运" : "架上包 / 工作簿配置")
-        : "情景一 / 渠道日报归集";
+        : "单表 / 渠道日报归集";
   document.querySelector(".content-subtitle").textContent = standalonePage
     ? shooterPage ? "按所选日期查看投手消耗。" : "查看截至所选日期最近 5 天的渠道消耗。"
     : state.page === "scenario2-overview"
-      ? "查看情景二每日处理状态，确认空值跳过与冲突数据。"
+      ? "查看多表匹配每日处理状态，确认空值跳过与冲突数据。"
       : secondary
         ? "管理甲方日报与自己的日报配对。"
         : shelf
@@ -888,9 +788,10 @@ function render() {
   document.querySelectorAll(".scenario-group").forEach((group) => {
     group.classList.toggle("has-active", Boolean(group.querySelector(`.menu-item[data-page="${state.page}"]`)));
   });
-  document.querySelector('[data-scenario-status="scenario-1"]').textContent = scenarioData("scenario-1").sources?.some((source) => source.enabled) ? "已配置" : "待配置";
-  document.querySelector('[data-scenario-status="scenario-2"]').textContent = scenarioData("scenario-2").pairs?.some((pair) => pair.enabled) ? "已配置" : "待配置";
-  document.querySelector('[data-scenario-status="scenario-3"]').textContent = scenarioData("scenario-3").books?.some((book) => book.enabled) ? "已配置" : "待配置";
+  for (const [scenario, definition] of Object.entries(scenarioDefinitions)) {
+    const configured = scenarioData(scenario)[definition.collection]?.some((item) => item.enabled);
+    document.querySelector(`[data-scenario-status="${scenario}"]`).textContent = configured ? "已配置" : "待配置";
+  }
   dateInput.closest(".date-field").hidden = !runPage;
   rulesButton.hidden = !runPage;
   previewButton.hidden = !runPage;
@@ -918,36 +819,59 @@ function navigateToPage(button) {
 async function importSources() {
   const button = document.querySelector("#importButton");
   const text = document.querySelector("#linkInput").value;
+  const name = document.querySelector("#sourceName")?.value.trim() || "";
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (name && lines.length > 1) {
+    notify("自定义名称仅适用于单个链接；批量导入请使用“名称 | 链接”格式", "error");
+    return;
+  }
   setLoading(button, true);
   try {
-    const data = await api(scenarioApi("scenario-1", "/sources/import"), { method: "POST", body: JSON.stringify({ text }) });
+    const data = await api(scenarioApi("scenario-1", "/sources/import"), { method: "POST", body: JSON.stringify({ text, name }) });
     state.scenarios["scenario-1"].sources = data.sources;
     const added = data.results.filter((item) => item.status === "added").length;
     const invalid = data.results.filter((item) => item.status === "invalid").length;
     notify(`成功导入 ${added} 个，重复或无效 ${data.results.length - added} 个${invalid ? `（无效 ${invalid} 个）` : ""}`);
-    renderSources();
+    render();
   } catch (error) { notify(error.message, "error"); }
   finally { setLoading(button, false); }
 }
 
-async function toggleSource(event) {
-  const source = scenarioData("scenario-1").sources.find((item) => item.id === event.currentTarget.dataset.toggle);
+async function toggleConfiguredEntity({ scenario, collection, id, endpoint, itemKey, renderPage }) {
+  const item = scenarioData(scenario)[collection].find((candidate) => candidate.id === id);
+  if (!item) return;
   try {
-    const data = await api(scenarioApi("scenario-1", `/sources/${source.id}`), { method: "PATCH", body: JSON.stringify({ enabled: !source.enabled }) });
-    Object.assign(source, data.source);
-    renderSources();
+    const data = await api(scenarioApi(scenario, endpoint(item)), { method: "PATCH", body: JSON.stringify({ enabled: !item.enabled }) });
+    Object.assign(item, data[itemKey]);
+    renderPage();
   } catch (error) { notify(error.message, "error"); }
 }
 
-async function deleteSource(event) {
-  const source = scenarioData("scenario-1").sources.find((item) => item.id === event.currentTarget.dataset.delete);
-  if (!window.confirm(`确认移除“${source.name}”的配置？不会删除 Google 表格；历史运行日志仍保留，但不再计入消耗统计。`)) return;
+async function deleteConfiguredEntity({ scenario, collection, id, endpoint, confirmMessage, successMessage, renderPage }) {
+  const item = scenarioData(scenario)[collection].find((candidate) => candidate.id === id);
+  if (!item || !window.confirm(confirmMessage(item))) return;
   try {
-    const data = await api(scenarioApi("scenario-1", `/sources/${source.id}`), { method: "DELETE" });
-    state.scenarios["scenario-1"].sources = data.sources;
-    notify("工作簿配置已移除");
-    renderSources();
+    const data = await api(scenarioApi(scenario, endpoint(item)), { method: "DELETE" });
+    state.scenarios[scenario][collection] = data[collection];
+    notify(successMessage);
+    renderPage();
   } catch (error) { notify(error.message, "error"); }
+}
+
+function toggleSource(event) {
+  return toggleConfiguredEntity({ scenario: "scenario-1", collection: "sources", id: event.currentTarget.dataset.toggle, endpoint: (source) => `/sources/${source.id}`, itemKey: "source", renderPage: renderSources });
+}
+
+function deleteSource(event) {
+  return deleteConfiguredEntity({
+    scenario: "scenario-1",
+    collection: "sources",
+    id: event.currentTarget.dataset.delete,
+    endpoint: (source) => `/sources/${source.id}`,
+    confirmMessage: (source) => `确认移除“${source.name}”的配置？不会删除 Google 表格；历史运行日志仍保留，但不再计入消耗统计。`,
+    successMessage: "工作簿配置已移除",
+    renderPage: renderSources
+  });
 }
 
 async function addPair() {
@@ -960,29 +884,25 @@ async function addPair() {
     const data = await api(scenarioApi("scenario-2", "/pairs"), { method: "POST", body: JSON.stringify({ name, clientUrl, ownUrl }) });
     state.scenarios["scenario-2"].pairs = data.pairs;
     notify("日报配对已添加");
-    renderScenario2ConfigModern();
+    renderScenario2Config();
   } catch (error) { notify(error.message, "error"); }
   finally { setLoading(button, false); }
 }
 
-async function togglePair(event) {
-  const pair = scenarioData("scenario-2").pairs.find((item) => item.id === event.currentTarget.dataset.pairToggle);
-  try {
-    const data = await api(scenarioApi("scenario-2", `/pairs/${pair.id}`), { method: "PATCH", body: JSON.stringify({ enabled: !pair.enabled }) });
-    Object.assign(pair, data.pair);
-    renderScenario2ConfigModern();
-  } catch (error) { notify(error.message, "error"); }
+function togglePair(event) {
+  return toggleConfiguredEntity({ scenario: "scenario-2", collection: "pairs", id: event.currentTarget.dataset.pairToggle, endpoint: (pair) => `/pairs/${pair.id}`, itemKey: "pair", renderPage: renderScenario2Config });
 }
 
-async function deletePair(event) {
-  const pair = scenarioData("scenario-2").pairs.find((item) => item.id === event.currentTarget.dataset.pairDelete);
-  if (!window.confirm(`确认移除“${pair.name}”？不会删除 Google 表格；历史运行日志仍保留，但不再计入消耗统计。`)) return;
-  try {
-    const data = await api(scenarioApi("scenario-2", `/pairs/${pair.id}`), { method: "DELETE" });
-    state.scenarios["scenario-2"].pairs = data.pairs;
-    notify("日报配对已移除");
-    renderScenario2ConfigModern();
-  } catch (error) { notify(error.message, "error"); }
+function deletePair(event) {
+  return deleteConfiguredEntity({
+    scenario: "scenario-2",
+    collection: "pairs",
+    id: event.currentTarget.dataset.pairDelete,
+    endpoint: (pair) => `/pairs/${pair.id}`,
+    confirmMessage: (pair) => `确认移除“${pair.name}”？不会删除 Google 表格；历史运行日志仍保留，但不再计入消耗统计。`,
+    successMessage: "日报配对已移除",
+    renderPage: renderScenario2Config
+  });
 }
 
 async function addShelfBook() {
@@ -999,31 +919,26 @@ async function addShelfBook() {
   finally { setLoading(button, false); }
 }
 
-async function toggleShelfBook(event) {
-  const book = scenarioData("scenario-3").books.find((item) => item.id === event.currentTarget.dataset.shelfToggle);
-  if (!book) return;
-  try {
-    const data = await api(scenarioApi("scenario-3", `/books/${book.id}`), { method: "PATCH", body: JSON.stringify({ enabled: !book.enabled }) });
-    Object.assign(book, data.book);
-    renderScenario3Config();
-  } catch (error) { notify(error.message, "error"); }
+function toggleShelfBook(event) {
+  return toggleConfiguredEntity({ scenario: "scenario-3", collection: "books", id: event.currentTarget.dataset.shelfToggle, endpoint: (book) => `/books/${book.id}`, itemKey: "book", renderPage: renderScenario3Config });
 }
 
-async function deleteShelfBook(event) {
-  const book = scenarioData("scenario-3").books.find((item) => item.id === event.currentTarget.dataset.shelfDelete);
-  if (!book || !window.confirm(`确认移除“${book.name}”？不会删除 Google 表格。`)) return;
-  try {
-    const data = await api(scenarioApi("scenario-3", `/books/${book.id}`), { method: "DELETE" });
-    state.scenarios["scenario-3"].books = data.books;
-    notify("架上包工作簿已移除");
-    renderScenario3Config();
-  } catch (error) { notify(error.message, "error"); }
+function deleteShelfBook(event) {
+  return deleteConfiguredEntity({
+    scenario: "scenario-3",
+    collection: "books",
+    id: event.currentTarget.dataset.shelfDelete,
+    endpoint: (book) => `/books/${book.id}`,
+    confirmMessage: (book) => `确认移除“${book.name}”？不会删除 Google 表格。`,
+    successMessage: "架上包工作簿已移除",
+    renderPage: renderScenario3Config
+  });
 }
 
 async function runJob(type, triggerButton = null) {
   if (activeJobRequest) return;
   const button = triggerButton || (type === "run" ? runButton : previewButton);
-  const scenario = state.page.startsWith("scenario2") ? "scenario-2" : state.page.startsWith("scenario3") ? "scenario-3" : "scenario-1";
+  const scenario = scenarioForPage(state.page);
   activeJobRequest = true;
   setLoading(button, true);
   previewButton.disabled = true;
@@ -1031,9 +946,9 @@ async function runJob(type, triggerButton = null) {
   try {
     const run = await api(scenarioApi(scenario, `/jobs/${type}`), { method: "POST", body: JSON.stringify({ date: dateInput.value }) });
     state.scenarios[scenario].runs.unshift(run);
-    state.page = scenario === "scenario-2" ? "scenario2-overview" : scenario === "scenario-3" ? "scenario3-overview" : "overview";
+    state.page = scenarioDefinitions[scenario].overviewPage;
     render();
-    notify(type === "run" ? `${scenario === "scenario-2" ? "配对日报" : scenario === "scenario-3" ? "架上包" : "情景一"}正式写入任务已完成` : "预览已完成");
+    notify(type === "run" ? `${scenarioDefinitions[scenario].jobLabel}正式写入任务已完成` : "预览已完成");
   } catch (error) { notify(error.message, "error"); }
   finally {
     setLoading(button, false);

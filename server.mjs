@@ -1,17 +1,19 @@
 import { createServer } from "node:http";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { extname, join, normalize } from "node:path";
+import { readFile } from "node:fs/promises";
+import { extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collectWorkbook, executeWorkbook } from "./src/collector.mjs";
 import { collectScenario2Pair, executeScenario2Pair } from "./src/scenario2.mjs";
 import { collectShelfBook, executeShelfBook } from "./src/shelf-pack.mjs";
 import { getConnectionStatus } from "./src/google-sheets.mjs";
+import { JsonStateStore } from "./src/state-store.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = join(root, "public");
 const dataDir = join(root, "data");
 const stateFile = join(dataDir, "state.json");
 const port = Number(process.env.PORT || 4173);
+const host = process.env.HOST || "127.0.0.1";
 const activeJobKeys = new Set();
 
 const defaultShelfBook = {
@@ -40,18 +42,9 @@ const mimeTypes = {
   ".svg": "image/svg+xml"
 };
 
-await mkdir(dataDir, { recursive: true });
+const stateStore = new JsonStateStore(stateFile, { defaultState, normalize: normalizeState });
 
-async function readState() {
-  try {
-    return normalizeState(JSON.parse(await readFile(stateFile, "utf8")));
-  } catch (error) {
-    if (error.code === "ENOENT") return structuredClone(defaultState);
-    throw error;
-  }
-}
-
-function normalizeState(raw) {
+export function normalizeState(raw) {
   const primary = raw.scenarios?.["scenario-1"];
   const secondary = raw.scenarios?.["scenario-2"];
   const shelf = raw.scenarios?.["scenario-3"];
@@ -79,10 +72,6 @@ function normalizeState(raw) {
   };
 }
 
-async function saveState(state) {
-  await writeFile(stateFile, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-}
-
 function sendJson(response, status, body) {
   response.writeHead(status, jsonHeaders);
   response.end(JSON.stringify(body));
@@ -91,7 +80,9 @@ function sendJson(response, status, body) {
 function acquireJobLock(response, key) {
   if (activeJobKeys.has(key)) return false;
   activeJobKeys.add(key);
-  response.once("finish", () => activeJobKeys.delete(key));
+  const release = () => activeJobKeys.delete(key);
+  response.once("finish", release);
+  response.once("close", release);
   return true;
 }
 
@@ -166,8 +157,8 @@ function newShelfBook({ name, url }) {
   const parsed = parseSheetLink(url);
   return {
     id: crypto.randomUUID(),
-    name: String(name || "").trim() || parsed.name || "架上包数据表",
     ...parsed,
+    name: String(name || "").trim() || parsed.name || "架上包数据表",
     enabled: true,
     scenario: "scenario-3",
     createdAt: new Date().toISOString()
@@ -178,34 +169,145 @@ function scenarioState(state, key = "scenario-1") {
   return state.scenarios[key];
 }
 
-async function importSources(request, response, state) {
-  const { text = "" } = await readJson(request);
-  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  if (!lines.length) return sendJson(response, 400, { error: "请至少输入一个 Google 表格链接" });
-  const scope = scenarioState(state);
-  const results = [];
-  for (const line of lines) {
-    try {
-      const parsed = parseSheetLink(line);
-      const existing = scope.sources.find((item) => item.spreadsheetId === parsed.spreadsheetId);
-      if (existing) results.push({ status: "duplicate", name: existing.name, url: existing.url });
-      else {
-        const source = newSource(parsed);
-        scope.sources.push(source);
-        results.push({ status: "added", name: source.name, url: source.url });
-      }
-    } catch (error) {
-      results.push({ status: "invalid", name: line, error: error.message });
-    }
-  }
-  await saveState(state);
-  return sendJson(response, 200, { scenario: "scenario-1", results, sources: scope.sources });
+function httpError(status, message) {
+  return Object.assign(new Error(message), { status });
 }
 
-async function handleApi(request, response, pathname) {
-  const state = await readState();
+async function sendStateMutation(response, mutator, store = stateStore) {
+  try {
+    return sendJson(response, 200, await store.mutate(mutator));
+  } catch (error) {
+    return sendJson(response, error.status || 400, { error: error.message });
+  }
+}
 
+const entityDefinitions = {
+  source: { scenario: "scenario-1", collection: "sources", itemKey: "source", allowed: ["name", "enabled", "targetSheet"], notFound: "未找到该工作簿", deleteExtra: { scenario: "scenario-1" } },
+  pair: { scenario: "scenario-2", collection: "pairs", itemKey: "pair", allowed: ["name", "enabled", "targetSheet"], notFound: "未找到该日报配对" },
+  book: { scenario: "scenario-3", collection: "books", itemKey: "book", allowed: ["name", "enabled"], notFound: "未找到该架上包工作簿" }
+};
+
+async function patchEntity(request, response, definition, id, store) {
+  const changes = await readJson(request);
+  return sendStateMutation(response, (state) => {
+    const items = scenarioState(state, definition.scenario)[definition.collection];
+    const item = items.find((candidate) => candidate.id === id);
+    if (!item) throw httpError(404, definition.notFound);
+    for (const key of definition.allowed) {
+      if (key in changes) item[key] = changes[key];
+    }
+    return { [definition.itemKey]: item };
+  }, store);
+}
+
+async function deleteEntity(response, definition, id, store) {
+  return sendStateMutation(response, (state) => {
+    const scope = scenarioState(state, definition.scenario);
+    const items = scope[definition.collection];
+    const remaining = items.filter((item) => item.id !== id);
+    if (remaining.length === items.length) throw httpError(404, definition.notFound);
+    scope[definition.collection] = remaining;
+    return { ...definition.deleteExtra, [definition.collection]: remaining };
+  }, store);
+}
+
+const jobDefinitions = {
+  "scenario-1": {
+    collection: "sources",
+    idsKey: "sourceIds",
+    emptyMessage: "没有已启用的工作簿",
+    lockedMessage: "单表已有任务正在执行，请稍后再试",
+    collect: collectWorkbook,
+    execute: executeWorkbook,
+    failed: (source, error) => ({ sourceId: source.id, sourceName: source.name, status: "failed", error: error.message, rows: [] })
+  },
+  "scenario-2": {
+    collection: "pairs",
+    idsKey: "pairIds",
+    emptyMessage: "没有已启用的日报配对",
+    lockedMessage: "多表匹配已有任务正在执行，请稍后再试",
+    collect: collectScenario2Pair,
+    execute: executeScenario2Pair,
+    failed: (pair, error) => ({ pairId: pair.id, pairName: pair.name, sourceName: pair.client.name, targetName: pair.own.name, status: "failed", error: error.message, rows: [] })
+  },
+  "scenario-3": {
+    collection: "books",
+    idsKey: "bookIds",
+    emptyMessage: "没有已启用的架上包工作簿",
+    lockedMessage: "架上包已有任务正在执行，请稍后再试",
+    collect: collectShelfBook,
+    execute: executeShelfBook,
+    failed: (book, error) => ({ sourceId: book.id, sourceName: book.name, status: "failed", error: error.message, rows: [] })
+  }
+};
+
+async function runScenarioJob(request, response, scenario, type, store) {
+  const definition = jobDefinitions[scenario];
+  if (!acquireJobLock(response, scenario)) return sendJson(response, 409, { error: definition.lockedMessage });
+  const body = await readJson(request);
+  const businessDate = body.date || new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+  const ids = Array.isArray(body[definition.idsKey]) ? body[definition.idsKey] : [];
+  const snapshot = await store.read();
+  const selected = scenarioState(snapshot, scenario)[definition.collection]
+    .filter((item) => item.enabled && (!ids.length || ids.includes(item.id)));
+  if (!selected.length) return sendJson(response, 400, { error: definition.emptyMessage });
+
+  const execute = type === "run";
+  const results = [];
+  for (const item of selected) {
+    try {
+      results.push(await (execute ? definition.execute(item, businessDate) : definition.collect(item, businessDate)));
+    } catch (error) {
+      results.push(definition.failed(item, error));
+    }
+  }
+  const run = {
+    id: crypto.randomUUID(),
+    type: execute ? "run" : "preview",
+    scenario,
+    businessDate,
+    createdAt: new Date().toISOString(),
+    summary: summarize(results),
+    results
+  };
+  await store.mutate((state) => {
+    const scope = scenarioState(state, scenario);
+    scope.runs = [run, ...scope.runs].slice(0, 50);
+  });
+  return sendJson(response, 200, run);
+}
+
+async function importSources(request, response, store) {
+  const { text = "", name = "" } = await readJson(request);
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (!lines.length) return sendJson(response, 400, { error: "请至少输入一个 Google 表格链接" });
+  const customName = String(name || "").trim();
+  const payload = await store.mutate((state) => {
+    const scope = scenarioState(state);
+    const results = [];
+    for (const line of lines) {
+      try {
+        const parsed = parseSheetLink(line);
+        if (customName && lines.length === 1) parsed.name = customName;
+        const existing = scope.sources.find((item) => item.spreadsheetId === parsed.spreadsheetId);
+        if (existing) results.push({ status: "duplicate", name: existing.name, url: existing.url });
+        else {
+          const source = newSource(parsed);
+          scope.sources.push(source);
+          results.push({ status: "added", name: source.name, url: source.url });
+        }
+      } catch (error) {
+        results.push({ status: "invalid", name: line, error: error.message });
+      }
+    }
+    return { scenario: "scenario-1", results, sources: scope.sources };
+  });
+  return sendJson(response, 200, payload);
+}
+
+async function handleApi(request, response, pathname, store) {
   if (request.method === "GET" && pathname === "/api/bootstrap") {
+    const state = await store.read();
     const primary = scenarioState(state);
     const secondary = scenarioState(state, "scenario-2");
     const shelf = scenarioState(state, "scenario-3");
@@ -223,205 +325,88 @@ async function handleApi(request, response, pathname) {
   }
 
   if (request.method === "POST" && pathname === "/api/sources/import") {
-    return importSources(request, response, state);
+    return importSources(request, response, store);
   }
 
   const scenarioImportMatch = pathname.match(/^\/api\/scenarios\/(scenario-1)\/sources\/import$/);
   if (request.method === "POST" && scenarioImportMatch) {
-    return importSources(request, response, state);
+    return importSources(request, response, store);
   }
 
   if (request.method === "POST" && pathname === "/api/scenarios/scenario-2/pairs") {
-    const scope = scenarioState(state, "scenario-2");
     try {
       const pair = newPair(await readJson(request));
-      const duplicate = scope.pairs.find((item) => item.client.spreadsheetId === pair.client.spreadsheetId || item.own.spreadsheetId === pair.own.spreadsheetId);
-      if (duplicate) return sendJson(response, 409, { error: `工作簿已属于配对“${duplicate.name}”` });
-      scope.pairs.push(pair);
-      await saveState(state);
-      return sendJson(response, 200, { pair, pairs: scope.pairs });
+      return sendStateMutation(response, (state) => {
+        const scope = scenarioState(state, "scenario-2");
+        const duplicate = scope.pairs.find((item) => item.client.spreadsheetId === pair.client.spreadsheetId || item.own.spreadsheetId === pair.own.spreadsheetId);
+        if (duplicate) throw httpError(409, `工作簿已属于配对“${duplicate.name}”`);
+        scope.pairs.push(pair);
+        return { pair, pairs: scope.pairs };
+      }, store);
     } catch (error) {
-      return sendJson(response, 400, { error: error.message });
+      return sendJson(response, error.status || 400, { error: error.message });
     }
   }
 
   if (request.method === "POST" && pathname === "/api/scenarios/scenario-3/books") {
-    const scope = scenarioState(state, "scenario-3");
     try {
       const book = newShelfBook(await readJson(request));
-      const duplicate = scope.books.find((item) => item.spreadsheetId === book.spreadsheetId);
-      if (duplicate) return sendJson(response, 409, { error: `工作簿已配置为“${duplicate.name}”` });
-      scope.books.push(book);
-      await saveState(state);
-      return sendJson(response, 200, { book, books: scope.books });
+      return sendStateMutation(response, (state) => {
+        const scope = scenarioState(state, "scenario-3");
+        const duplicate = scope.books.find((item) => item.spreadsheetId === book.spreadsheetId);
+        if (duplicate) throw httpError(409, `工作簿已配置为“${duplicate.name}”`);
+        scope.books.push(book);
+        return { book, books: scope.books };
+      }, store);
     } catch (error) {
-      return sendJson(response, 400, { error: error.message });
+      return sendJson(response, error.status || 400, { error: error.message });
     }
   }
 
   const pairMatch = pathname.match(/^\/api\/scenarios\/scenario-2\/pairs\/([^/]+)$/);
   if (pairMatch && request.method === "PATCH") {
-    const scope = scenarioState(state, "scenario-2");
-    const pair = scope.pairs.find((item) => item.id === pairMatch[1]);
-    if (!pair) return sendJson(response, 404, { error: "未找到该日报配对" });
-    const changes = await readJson(request);
-    for (const key of ["name", "enabled", "targetSheet"]) {
-      if (key in changes) pair[key] = changes[key];
-    }
-    await saveState(state);
-    return sendJson(response, 200, { pair });
+    return patchEntity(request, response, entityDefinitions.pair, pairMatch[1], store);
   }
 
   if (pairMatch && request.method === "DELETE") {
-    const scope = scenarioState(state, "scenario-2");
-    const before = scope.pairs.length;
-    scope.pairs = scope.pairs.filter((item) => item.id !== pairMatch[1]);
-    if (scope.pairs.length === before) return sendJson(response, 404, { error: "未找到该日报配对" });
-    await saveState(state);
-    return sendJson(response, 200, { pairs: scope.pairs });
+    return deleteEntity(response, entityDefinitions.pair, pairMatch[1], store);
   }
 
   const shelfBookMatch = pathname.match(/^\/api\/scenarios\/scenario-3\/books\/([^/]+)$/);
   if (shelfBookMatch && request.method === "PATCH") {
-    const scope = scenarioState(state, "scenario-3");
-    const book = scope.books.find((item) => item.id === shelfBookMatch[1]);
-    if (!book) return sendJson(response, 404, { error: "未找到该架上包工作簿" });
-    const changes = await readJson(request);
-    for (const key of ["name", "enabled"]) {
-      if (key in changes) book[key] = changes[key];
-    }
-    await saveState(state);
-    return sendJson(response, 200, { book });
+    return patchEntity(request, response, entityDefinitions.book, shelfBookMatch[1], store);
   }
 
   if (shelfBookMatch && request.method === "DELETE") {
-    const scope = scenarioState(state, "scenario-3");
-    const before = scope.books.length;
-    scope.books = scope.books.filter((item) => item.id !== shelfBookMatch[1]);
-    if (scope.books.length === before) return sendJson(response, 404, { error: "未找到该架上包工作簿" });
-    await saveState(state);
-    return sendJson(response, 200, { books: scope.books });
+    return deleteEntity(response, entityDefinitions.book, shelfBookMatch[1], store);
   }
 
   const scopedSourceMatch = pathname.match(/^\/api\/scenarios\/(scenario-1)\/sources\/([^/]+)$/);
   const legacySourceMatch = pathname.match(/^\/api\/sources\/([^/]+)$/);
   const sourceId = scopedSourceMatch?.[2] || legacySourceMatch?.[1];
-  const sourceScope = scenarioState(state);
   if (sourceId && request.method === "PATCH") {
-    const source = sourceScope.sources.find((item) => item.id === sourceId);
-    if (!source) return sendJson(response, 404, { error: "未找到该工作簿" });
-    const changes = await readJson(request);
-    for (const key of ["name", "enabled", "targetSheet"]) {
-      if (key in changes) source[key] = changes[key];
-    }
-    await saveState(state);
-    return sendJson(response, 200, { source });
+    return patchEntity(request, response, entityDefinitions.source, sourceId, store);
   }
 
   if (sourceId && request.method === "DELETE") {
-    const before = sourceScope.sources.length;
-    sourceScope.sources = sourceScope.sources.filter((item) => item.id !== sourceId);
-    if (sourceScope.sources.length === before) return sendJson(response, 404, { error: "未找到该工作簿" });
-    await saveState(state);
-    return sendJson(response, 200, { scenario: "scenario-1", sources: sourceScope.sources });
+    return deleteEntity(response, entityDefinitions.source, sourceId, store);
   }
 
   const scopedJobMatch = pathname.match(/^\/api\/scenarios\/(scenario-1)\/jobs\/(preview|run)$/);
   const legacyJobMatch = pathname.match(/^\/api\/jobs\/(preview|run)$/);
   const jobType = scopedJobMatch?.[2] || legacyJobMatch?.[1];
-  if (jobType && (scopedJobMatch || legacyJobMatch)) {
-    if (!acquireJobLock(response, "scenario-1")) return sendJson(response, 409, { error: "情景一已有任务正在执行，请稍后再试" });
-    const { date, sourceIds = [] } = await readJson(request);
-    const businessDate = date || new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
-    const scope = scenarioState(state);
-    const selected = scope.sources.filter((source) => source.enabled && (!sourceIds.length || sourceIds.includes(source.id)));
-    if (!selected.length) return sendJson(response, 400, { error: "没有已启用的工作簿" });
-    const execute = jobType === "run";
-    const results = [];
-    for (const source of selected) {
-      try {
-        results.push(await (execute ? executeWorkbook(source, businessDate) : collectWorkbook(source, businessDate)));
-      } catch (error) {
-        results.push({ sourceId: source.id, sourceName: source.name, status: "failed", error: error.message, rows: [] });
-      }
-    }
-    const run = {
-      id: crypto.randomUUID(),
-      type: execute ? "run" : "preview",
-      scenario: "scenario-1",
-      businessDate,
-      createdAt: new Date().toISOString(),
-      summary: summarize(results),
-      results
-    };
-    scope.runs.unshift(run);
-    scope.runs = scope.runs.slice(0, 50);
-    await saveState(state);
-    return sendJson(response, 200, run);
+  if (request.method === "POST" && jobType && (scopedJobMatch || legacyJobMatch)) {
+    return runScenarioJob(request, response, "scenario-1", jobType, store);
   }
 
   const scenario2JobMatch = pathname.match(/^\/api\/scenarios\/scenario-2\/jobs\/(preview|run)$/);
   if (scenario2JobMatch && request.method === "POST") {
-    if (!acquireJobLock(response, "scenario-2")) return sendJson(response, 409, { error: "情景二已有任务正在执行，请稍后再试" });
-    const { date, pairIds = [] } = await readJson(request);
-    const businessDate = date || new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
-    const scope = scenarioState(state, "scenario-2");
-    const selected = scope.pairs.filter((pair) => pair.enabled && (!pairIds.length || pairIds.includes(pair.id)));
-    if (!selected.length) return sendJson(response, 400, { error: "没有已启用的日报配对" });
-    const execute = scenario2JobMatch[1] === "run";
-    const results = [];
-    for (const pair of selected) {
-      try {
-        results.push(await (execute ? executeScenario2Pair(pair, businessDate) : collectScenario2Pair(pair, businessDate)));
-      } catch (error) {
-        results.push({ pairId: pair.id, pairName: pair.name, sourceName: pair.client.name, targetName: pair.own.name, status: "failed", error: error.message, rows: [] });
-      }
-    }
-    const run = {
-      id: crypto.randomUUID(),
-      type: execute ? "run" : "preview",
-      scenario: "scenario-2",
-      businessDate,
-      createdAt: new Date().toISOString(),
-      summary: summarize(results),
-      results
-    };
-    scope.runs.unshift(run);
-    scope.runs = scope.runs.slice(0, 50);
-    await saveState(state);
-    return sendJson(response, 200, run);
+    return runScenarioJob(request, response, "scenario-2", scenario2JobMatch[1], store);
   }
 
   const shelfJobMatch = pathname.match(/^\/api\/scenarios\/scenario-3\/jobs\/(preview|run)$/);
   if (shelfJobMatch && request.method === "POST") {
-    if (!acquireJobLock(response, "scenario-3")) return sendJson(response, 409, { error: "架上包已有任务正在执行，请稍后再试" });
-    const { date, bookIds = [] } = await readJson(request);
-    const businessDate = date || new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
-    const scope = scenarioState(state, "scenario-3");
-    const selected = scope.books.filter((book) => book.enabled && (!bookIds.length || bookIds.includes(book.id)));
-    if (!selected.length) return sendJson(response, 400, { error: "没有已启用的架上包工作簿" });
-    const execute = shelfJobMatch[1] === "run";
-    const results = [];
-    for (const book of selected) {
-      try {
-        results.push(await (execute ? executeShelfBook(book, businessDate) : collectShelfBook(book, businessDate)));
-      } catch (error) {
-        results.push({ sourceId: book.id, sourceName: book.name, status: "failed", error: error.message, rows: [] });
-      }
-    }
-    const run = {
-      id: crypto.randomUUID(),
-      type: execute ? "run" : "preview",
-      scenario: "scenario-3",
-      businessDate,
-      createdAt: new Date().toISOString(),
-      summary: summarize(results),
-      results
-    };
-    scope.runs.unshift(run);
-    scope.runs = scope.runs.slice(0, 50);
-    await saveState(state);
-    return sendJson(response, 200, run);
+    return runScenarioJob(request, response, "scenario-3", shelfJobMatch[1], store);
   }
 
   return sendJson(response, 404, { error: "接口不存在" });
@@ -441,10 +426,34 @@ function summarize(results) {
   };
 }
 
-async function serveStatic(response, pathname) {
+export function resolvePublicPath(pathname) {
   const requested = pathname === "/" ? "index.html" : pathname.slice(1);
-  const path = normalize(join(publicDir, requested));
-  if (!path.startsWith(publicDir)) return sendJson(response, 403, { error: "禁止访问" });
+  const path = resolve(publicDir, requested);
+  const localPath = relative(publicDir, path);
+  if (localPath.startsWith("..") || isAbsolute(localPath)) return null;
+  return path;
+}
+
+export function validateApiRequest(request) {
+  if (["GET", "HEAD"].includes(request.method)) return null;
+  const origin = request.headers.origin;
+  if (origin) {
+    try {
+      const hostname = new URL(origin).hostname;
+      if (!["localhost", "127.0.0.1", "::1"].includes(hostname)) return { status: 403, error: "拒绝非本机来源的写入请求" };
+    } catch {
+      return { status: 403, error: "请求来源无效" };
+    }
+  }
+  if (["POST", "PATCH"].includes(request.method) && !String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+    return { status: 415, error: "写入请求必须使用 application/json" };
+  }
+  return null;
+}
+
+async function serveStatic(response, pathname) {
+  const path = resolvePublicPath(pathname);
+  if (!path) return sendJson(response, 403, { error: "禁止访问" });
   try {
     const content = await readFile(path);
     response.writeHead(200, { "content-type": mimeTypes[extname(path)] || "application/octet-stream" });
@@ -454,14 +463,26 @@ async function serveStatic(response, pathname) {
   }
 }
 
-createServer(async (request, response) => {
-  try {
-    const { pathname } = new URL(request.url, `http://${request.headers.host}`);
-    if (pathname.startsWith("/api/")) await handleApi(request, response, pathname);
-    else await serveStatic(response, pathname);
-  } catch (error) {
-    sendJson(response, 500, { error: error.message || "服务器错误" });
-  }
-}).listen(port, () => {
-  console.log(`Daily Data Hub 已启动：http://localhost:${port}`);
-});
+export function createDailyDataServer({ store = stateStore } = {}) {
+  return createServer(async (request, response) => {
+    try {
+      const { pathname } = new URL(request.url, `http://${request.headers.host}`);
+      if (pathname.startsWith("/api/")) {
+        const rejection = validateApiRequest(request);
+        if (rejection) return sendJson(response, rejection.status, { error: rejection.error });
+        await handleApi(request, response, pathname, store);
+      } else {
+        await serveStatic(response, pathname);
+      }
+    } catch (error) {
+      sendJson(response, 500, { error: error.message || "服务器错误" });
+    }
+  });
+}
+
+const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  createDailyDataServer().listen(port, host, () => {
+    console.log(`Daily Data Hub 已启动：http://localhost:${port}`);
+  });
+}

@@ -1,32 +1,9 @@
 import { batchWrite, getSheetValues, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
 import { mapConcurrent } from "./async-utils.mjs";
+import { columnName, combineTargetStatuses as combineStatus, dateKey, inspectTarget, isEmpty as empty, normalizeText as normalized, parseNumber } from "./spreadsheet-utils.mjs";
 
-const empty = (value) => value === undefined || value === null || (typeof value === "string" && value.trim() === "");
-const normalized = (value) => String(value ?? "").trim().toLowerCase().replaceAll(/\s+/g, "");
+export { dateKey } from "./spreadsheet-utils.mjs";
 const compact = (value) => normalized(value).replace(/[\-_—–（）()]/g, "");
-
-function parseNumber(value) {
-  if (empty(value)) return { kind: "blank" };
-  if (typeof value === "number" && Number.isFinite(value)) return { kind: "number", value };
-  const cleaned = String(value).trim().replaceAll(",", "").replace(/[¥￥$%]/g, "");
-  if (cleaned && Number.isFinite(Number(cleaned))) return { kind: "number", value: Number(cleaned) };
-  return { kind: "error", raw: value };
-}
-
-export function dateKey(value, businessDate = "") {
-  if (value instanceof Date) return value.toISOString().slice(0, 10);
-  if (typeof value === "number" && Number.isFinite(value)) {
-    const epoch = Date.UTC(1899, 11, 30);
-    return new Date(epoch + Math.round(value) * 86_400_000).toISOString().slice(0, 10);
-  }
-  const text = String(value ?? "").trim().replace(/[年月/.]/g, "-").replace("日", "");
-  const full = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
-  if (full) return `${full[1]}-${full[2].padStart(2, "0")}-${full[3].padStart(2, "0")}`;
-  const short = text.match(/^(\d{1,2})-(\d{1,2})$/);
-  if (!short) return "";
-  const year = /^\d{4}-/.test(businessDate) ? businessDate.slice(0, 4) : String(new Date().getFullYear());
-  return `${year}-${short[1].padStart(2, "0")}-${short[2].padStart(2, "0")}`;
-}
 
 function headerText(value) {
   return normalized(value).replace(/[\n\r]/g, "");
@@ -146,24 +123,6 @@ function parseCellRange(range) {
   return { title, cell, row: Number(match[2]) - 1, column };
 }
 
-function inspectTarget(value, sourceValue, range) {
-  if (empty(value)) return { status: "ready", value: null, range };
-  const parsed = parseNumber(value);
-  if (parsed.kind === "number" && parsed.value === sourceValue) return { status: "same", value: parsed.value, range };
-  return { status: "conflict", value, range };
-}
-
-function columnName(index) {
-  let value = index + 1;
-  let name = "";
-  while (value > 0) {
-    value -= 1;
-    name = String.fromCharCode(65 + (value % 26)) + name;
-    value = Math.floor(value / 26);
-  }
-  return name;
-}
-
 function targetMetricColumns(values, header) {
   const row = values[header.row] || [];
   return { spend: header.spend, returnSpend: header.returnSpend, row };
@@ -193,15 +152,6 @@ function locateTotalMetricColumn(values, header, shooter, metric) {
   if (matches.length === 1) return { column: matches[0] };
   if (matches.length > 1) return { error: `总表中投手 ${shooter} 的${metric}列不唯一` };
   return { error: `总表中未找到投手 ${shooter} 的${metric}列` };
-}
-
-function combineStatus(detail, total) {
-  const statuses = [detail?.status, total?.status];
-  if (statuses.includes("error")) return "error";
-  if (statuses.includes("conflict")) return "conflict";
-  if (statuses.includes("ready")) return "ready";
-  if (statuses.every((status) => status === "same" || status === "written")) return "same";
-  return "error";
 }
 
 function matchTargetSheet(shooter, targetSheets) {

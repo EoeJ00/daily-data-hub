@@ -1,5 +1,8 @@
 # Design System Master File
 
+> **CANONICAL:** This is the active design-system specification for the application.
+> Historical alternatives must defer to this file unless a page-specific rule explicitly overrides it.
+
 > **LOGIC:** When building a specific page, first check `design-system/pages/[page-name].md`.
 > If that file exists, its rules **override** this Master file.
 > If not, strictly follow the rules below.

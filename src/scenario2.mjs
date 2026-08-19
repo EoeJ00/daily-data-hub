@@ -1,5 +1,10 @@
 import { batchWrite, getSheetValues, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
 import { mapConcurrent } from "./async-utils.mjs";
+import { columnName, combineTargetStatuses as combineStatus, dateKey, inspectTarget as inspectSpreadsheetTarget, isEmpty as empty, parseNumber as parseSpreadsheetNumber } from "./spreadsheet-utils.mjs";
+import { looseRouteScore, normalizeRoute, normalizeScenarioText as normalized, routeIdentity, routeScore, shooterFallbackScore, totalChainScore } from "./scenario2-route.mjs";
+
+export { dateKey } from "./spreadsheet-utils.mjs";
+export { normalizeRoute } from "./scenario2-route.mjs";
 
 const sourceAliases = {
   date: ["日期", "时间", "date"],
@@ -7,15 +12,6 @@ const sourceAliases = {
   spend: ["花费（U）", "花费(U)", "花费", "消耗", "广告消耗", "spend"],
   returnSpend: ["回流", "回流消耗", "return spend"]
 };
-
-const empty = (value) => value === undefined || value === null || (typeof value === "string" && value.trim() === "");
-const normalized = (value) => String(value ?? "")
-  .trim()
-  .toLowerCase()
-  .replace(/[（]/g, "(")
-  .replace(/[）]/g, ")")
-  .replace(/[‐‑‒–—―]/g, "-")
-  .replaceAll(/\s+/g, "");
 
 function matches(value, aliases) {
   const target = normalized(value);
@@ -48,17 +44,6 @@ function findFieldColumn(cells, field) {
   return best.column;
 }
 
-function columnName(index) {
-  let value = index + 1;
-  let name = "";
-  while (value > 0) {
-    value -= 1;
-    name = String.fromCharCode(65 + (value % 26)) + name;
-    value = Math.floor(value / 26);
-  }
-  return name;
-}
-
 function sheetRange(sheet, row, column) {
   return `'${sheet.replaceAll("'", "''")}'!${columnName(column)}${row + 1}`;
 }
@@ -68,120 +53,7 @@ function roundMoney(value) {
 }
 
 function parseNumber(value) {
-  if (empty(value)) return { kind: "blank" };
-  if (typeof value === "number" && Number.isFinite(value)) return { kind: "number", value: roundMoney(value) };
-  const cleaned = String(value).trim().replaceAll(",", "").replace(/[¥￥$%]/g, "");
-  if (cleaned && Number.isFinite(Number(cleaned))) return { kind: "number", value: roundMoney(Number(cleaned)) };
-  return { kind: "error", raw: value };
-}
-
-export function dateKey(value, businessDate = "") {
-  if (value instanceof Date) return value.toISOString().slice(0, 10);
-  if (typeof value === "number" && Number.isFinite(value)) {
-    const epoch = Date.UTC(1899, 11, 30);
-    return new Date(epoch + Math.round(value) * 86_400_000).toISOString().slice(0, 10);
-  }
-  const text = String(value ?? "").trim().replace(/[年月/.]/g, "-").replace("日", "");
-  const full = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
-  if (full) return `${full[1]}-${full[2].padStart(2, "0")}-${full[3].padStart(2, "0")}`;
-  const short = text.match(/^(\d{1,2})-(\d{1,2})$/);
-  if (!short) return "";
-  const year = /^\d{4}-/.test(businessDate) ? businessDate.slice(0, 4) : String(new Date().getFullYear());
-  return `${year}-${short[1].padStart(2, "0")}-${short[2].padStart(2, "0")}`;
-}
-
-export function normalizeRoute(value) {
-  const raw = String(value ?? "").trim();
-  const clean = raw.replace(/[（]/g, "(").replace(/[）]/g, ")").replace(/[‐‑‒–—―]/g, "-").trim();
-  const shooterMatch = clean.match(/\(([^()]*)\)\s*$/);
-  const shooter = shooterMatch ? normalized(shooterMatch[1]) : "";
-  const base = (shooterMatch ? clean.slice(0, shooterMatch.index) : clean).trim();
-  const codeMatch = base.match(/(\d+)\s*$/)
-    || base.match(/(?:^|[-_\s])0*(\d+)(?=$|[-_\s（(])/);
-  return {
-    raw,
-    base,
-    fullChain: normalized(base),
-    code: codeMatch ? String(Number(codeMatch[1])) : "",
-    shooter
-  };
-}
-
-function routeTokens(value) {
-  const route = typeof value === "string" ? normalizeRoute(value) : value;
-  return String(route?.fullChain || "")
-    .split(/[-_]+/)
-    .filter(Boolean)
-    .map((token) => token.replace(/^0+(?=\d+$)/, "") || "0");
-}
-
-function suffixScore(source, target) {
-  const sourceTokens = routeTokens(source);
-  const targetTokens = routeTokens(target);
-  if (!sourceTokens.length || !targetTokens.length || targetTokens.length > sourceTokens.length) return 0;
-  const offset = sourceTokens.length - targetTokens.length;
-  return targetTokens.every((token, index) => token === sourceTokens[offset + index]) ? targetTokens.length : 0;
-}
-
-function routeScore(left, right) {
-  return Math.max(suffixScore(left, right), suffixScore(right, left));
-}
-
-function totalChainScore(left, right) {
-  const leftRoute = typeof left === "string" ? normalizeRoute(left) : left;
-  const rightRoute = typeof right === "string" ? normalizeRoute(right) : right;
-  const leftTokens = routeTokens(leftRoute);
-  const rightTokens = routeTokens(rightRoute);
-  if (!leftTokens.length || !rightTokens.length) return 0;
-  if (leftRoute.fullChain === rightRoute.fullChain) return 3000 + leftTokens.length;
-
-  const [shorter, longer] = leftTokens.length <= rightTokens.length
-    ? [leftTokens, rightTokens]
-    : [rightTokens, leftTokens];
-  const prefix = shorter.every((token, index) => token === longer[index]);
-  const suffixOffset = longer.length - shorter.length;
-  const suffix = shorter.every((token, index) => token === longer[suffixOffset + index]);
-  if (prefix || suffix) return 2000 + shorter.length;
-
-  const leftName = normalized(leftRoute.fullChain);
-  const rightName = normalized(rightRoute.fullChain);
-  const [shorterName, longerName] = leftName.length <= rightName.length
-    ? [leftName, rightName]
-    : [rightName, leftName];
-  return shorterName.length >= 2 && (longerName.startsWith(shorterName) || longerName.endsWith(shorterName))
-    ? 1500 + shorterName.length
-    : 0;
-}
-
-function shooterFallbackScore(targetRoute, headerRoute) {
-  const shooter = normalized(targetRoute?.shooter);
-  if (!shooter) return 0;
-  if (normalized(headerRoute?.shooter) === shooter) return 1000;
-  return normalized(headerRoute?.fullChain) === shooter ? 1000 : 0;
-}
-
-function looseRouteScore(left, right) {
-  const source = typeof left === "string" ? normalizeRoute(left) : left;
-  const target = typeof right === "string" ? normalizeRoute(right) : right;
-  if (!source?.fullChain || !target?.fullChain) return 0;
-  if (source.code && target.code && source.code !== target.code) return 0;
-  if (source.fullChain === target.fullChain) return 1000 + routeTokens(source).length;
-  const sourceTokens = routeTokens(source);
-  const targetTokens = routeTokens(target);
-  let common = 0;
-  for (let start = 0; start < sourceTokens.length; start += 1) {
-    for (let targetStart = 0; targetStart < targetTokens.length; targetStart += 1) {
-      let length = 0;
-      while (sourceTokens[start + length] && sourceTokens[start + length] === targetTokens[targetStart + length]) length += 1;
-      common = Math.max(common, length);
-    }
-  }
-  if (common >= 2) return 500 + common;
-  return source.code && target.code && source.code === target.code ? 100 : 0;
-}
-
-function routeIdentity(route) {
-  return route.fullChain || route.code;
+  return parseSpreadsheetNumber(value, roundMoney);
 }
 
 function markDuplicateRecords(records) {
@@ -426,10 +298,7 @@ function findDateRow(values, header, businessDate) {
 }
 
 function inspectTarget(value, sourceValue, range) {
-  if (empty(value)) return { status: "ready", value: null, range };
-  const parsed = parseNumber(value);
-  if (parsed.kind === "number" && parsed.value === sourceValue) return { status: "same", value: parsed.value, range };
-  return { status: "conflict", value, range };
+  return inspectSpreadsheetTarget(value, sourceValue, range, parseNumber);
 }
 
 function chooseDetailSheet(descriptors, row) {
@@ -545,13 +414,6 @@ function locateTotal(values, businessDate) {
     return { headerRow: row, dateColumn, dateRow: values.findIndex((cells, index) => index > row && dateKey(cells?.[dateColumn], businessDate) === businessDate) };
   }
   return null;
-}
-
-function combineStatus(detail, total) {
-  if (detail.status === "error" || total.status === "error") return "error";
-  if (detail.status === "conflict" || total.status === "conflict") return "conflict";
-  if (detail.status === "ready" || total.status === "ready") return "ready";
-  return "same";
 }
 
 async function readSheetMap(spreadsheetId, titles, deps, options = {}) {

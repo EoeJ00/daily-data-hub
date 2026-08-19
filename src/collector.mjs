@@ -1,7 +1,5 @@
 import { batchWrite, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
-
-const empty = (value) => value === undefined || value === null || (typeof value === "string" && value.trim() === "");
-const normalized = (value) => String(value ?? "").trim().toLowerCase().replaceAll(/\s+/g, "");
+import { columnName, isEmpty as empty, normalizeText as normalized, parseNumber } from "./spreadsheet-utils.mjs";
 
 function channelColumnName(channel) {
   const displayName = String(channel ?? "").trim();
@@ -11,14 +9,6 @@ function channelColumnName(channel) {
 function matches(value, aliases) {
   const target = normalized(value);
   return aliases.some((alias) => target === normalized(alias));
-}
-
-function parseNumber(value) {
-  if (empty(value)) return { kind: "blank" };
-  if (typeof value === "number" && Number.isFinite(value)) return { kind: "number", value };
-  const cleaned = String(value).trim().replaceAll(",", "").replace(/[¥￥$%]/g, "");
-  if (cleaned !== "" && Number.isFinite(Number(cleaned))) return { kind: "number", value: Number(cleaned) };
-  return { kind: "error", raw: value };
 }
 
 function dateKey(value) {
@@ -95,17 +85,6 @@ function locateMetricColumn(values, target, channel, metric) {
   return -1;
 }
 
-function columnName(index) {
-  let value = index + 1;
-  let name = "";
-  while (value > 0) {
-    value -= 1;
-    name = String.fromCharCode(65 + (value % 26)) + name;
-    value = Math.floor(value / 26);
-  }
-  return name;
-}
-
 function mapRows(rows, targetValues, target, targetSheet) {
   const metricColumnCache = new Map();
   return rows.map((row) => {
@@ -128,8 +107,10 @@ function mapRows(rows, targetValues, target, targetSheet) {
   });
 }
 
-export async function collectWorkbook(source, businessDate) {
-  const workbook = await getWorkbook(source.spreadsheetId);
+const defaultDeps = { batchWrite, getSheetValuesBatch, getWorkbook };
+
+export async function collectWorkbook(source, businessDate, deps = defaultDeps) {
+  const workbook = await deps.getWorkbook(source.spreadsheetId);
   const visibleSheets = workbook.sheets
     .filter(({ properties }) => !properties.hidden)
     .map(({ properties }) => properties.title);
@@ -137,7 +118,7 @@ export async function collectWorkbook(source, businessDate) {
   const channels = visibleSheets.filter((title) => !source.excludedSheets.includes(title));
   const titles = [...new Set([source.targetSheet, ...channels])];
   const ranges = titles.map((title) => `'${title.replaceAll("'", "''")}'`);
-  const values = await getSheetValuesBatch(source.spreadsheetId, ranges);
+  const values = await deps.getSheetValuesBatch(source.spreadsheetId, ranges);
   const valuesByTitle = new Map(titles.map((title, index) => [title, values[index] || []]));
   const targetValues = valuesByTitle.get(source.targetSheet) || [];
   const target = locateTarget(targetValues, businessDate);
@@ -154,10 +135,10 @@ export async function collectWorkbook(source, businessDate) {
   };
 }
 
-export async function executeWorkbook(source, businessDate) {
-  const preview = await collectWorkbook(source, businessDate);
+export async function executeWorkbook(source, businessDate, deps = defaultDeps) {
+  const preview = await collectWorkbook(source, businessDate, deps);
   const ready = preview.rows.filter((row) => row.status === "ready");
-  await batchWrite(source.spreadsheetId, ready.map((row) => ({ range: row.range, value: row.sourceValue })));
+  await deps.batchWrite(source.spreadsheetId, ready.map((row) => ({ range: row.range, value: row.sourceValue })));
   return {
     ...preview,
     rows: preview.rows.map((row) => row.status === "ready" ? { ...row, status: "written", message: "已写入并保留审计记录" } : row)

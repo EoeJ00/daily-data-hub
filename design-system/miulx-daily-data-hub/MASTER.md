@@ -1,5 +1,8 @@
 # Design System Master File
 
+> **ARCHIVED:** This exploratory specification is retained for reference only.
+> The active specification is `../daily-data-hub/MASTER.md`.
+
 > **LOGIC:** When building a specific page, first check `design-system/pages/[page-name].md`.
 > If that file exists, its rules **override** this Master file.
 > If not, strictly follow the rules below.
