@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { createPrivateKey, sign } from "node:crypto";
+import { quoteSheetTitle } from "./spreadsheet-utils.mjs";
 
 let tokenCache;
 let tokenRequest;
@@ -133,8 +134,8 @@ export async function getWorkbook(spreadsheetId) {
 
 export async function getSheetValues(spreadsheetId, sheetTitle, options = {}) {
   const selectedRange = options.range
-    ? `'${sheetTitle.replaceAll("'", "''")}'!${options.range}`
-    : `'${sheetTitle.replaceAll("'", "''")}'`;
+    ? `${quoteSheetTitle(sheetTitle)}!${options.range}`
+    : quoteSheetTitle(sheetTitle);
   const range = encodeURIComponent(selectedRange);
   const valueRenderOption = options.valueRenderOption || "UNFORMATTED_VALUE";
   const data = await googleRequest(`spreadsheets/${spreadsheetId}/values/${range}?majorDimension=ROWS&valueRenderOption=${encodeURIComponent(valueRenderOption)}`);

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { collectScenario2Pair, dateKey, executeScenario2Pair, extractBigCellRecords, extractClientRecords, extractStandaloneChainRecords, locateTotalColumn, normalizeRoute } from "../src/scenario2.mjs";
+import { looseRouteScore } from "../src/scenario2-route.mjs";
 
 test("normalizes full and short channel formats to the same route code", () => {
   assert.deepEqual(normalizeRoute("MMY-XIONG-SS1-34（ROY）"), {
@@ -14,6 +15,10 @@ test("normalizes full and short channel formats to the same route code", () => {
   assert.equal(normalizeRoute("34 ( ROY )").shooter, "roy");
   assert.equal(normalizeRoute("11yXxZgy02(SUKI)").code, "2");
   assert.equal(normalizeRoute("5525006-FB-在投").code, "5525006");
+});
+
+test("matches a compound client sheet with the own shooter sheet by route code", () => {
+  assert.ok(looseRouteScore(normalizeRoute("3325046(S)"), normalizeRoute("3325046-FB-在投")) > 0);
 });
 
 test("normalizes Google serial and short dates against the business year", () => {
@@ -60,6 +65,30 @@ test("extracts a repeated daily block and carries its merged date downward", () 
     ["34", "回流消耗", "pending", 0.86],
     ["35", "消耗", "pending", 12.5],
     ["35", "回流消耗", "pending", 0]
+  ]);
+});
+
+test("treats a client block without metric columns as blank source cells", () => {
+  const rows = extractClientRecords([
+    ["日期", "渠道号"],
+    [46247, "3325046-FB-在投"]
+  ], "2026-08-13", "甲方日报");
+
+  assert.deepEqual(rows.map((row) => [row.routeCode, row.metric, row.status, row.message]), [
+    ["3325046", "消耗", "blank", "甲方源单元格为空，已跳过"],
+    ["3325046", "回流消耗", "blank", "甲方源单元格为空，已跳过"]
+  ]);
+});
+
+test("matches a new compound client sheet by route code and skips its missing metric cell", () => {
+  const rows = extractStandaloneChainRecords([
+    ["日期", "消耗"],
+    [46247, ""]
+  ], "2026-08-13", "3325046-FB-在投", "3325046-FB-在投");
+
+  assert.deepEqual(rows.map((row) => [row.routeCode, row.metric, row.status]), [
+    ["3325046", "消耗", "blank"],
+    ["3325046", "回流消耗", "blank"]
   ]);
 });
 
@@ -185,7 +214,7 @@ test("writes detail rows first, rechecks them, and then writes the total", async
   assert.ok(result.rows.every((row) => row.detail.status === "same" && row.total.status === "same"));
 });
 
-test("reads one client chain per visible sheet and maps it by chain identity", async () => {
+test("ignores hidden own and client chain sheets during matching", async () => {
   const clientId = "single-sheet-client";
   const ownId = "single-sheet-own";
   const values = new Map([
@@ -196,8 +225,8 @@ test("reads one client chain per visible sheet and maps it by chain identity", a
     [`${ownId}:37(YC)`, [["日期", "渠道号", "消耗", "回流消耗"], [46247, "", "", ""]]]
   ]);
   const workbook = (id) => id === clientId
-    ? { properties: { title: "甲方逐链日报" }, sheets: ["汇总", "SS1-34(ROY)", "MMY-XIONG-SS1-37(YC)"].map((title, index) => ({ properties: { sheetId: index + 1, title } })) }
-    : { properties: { title: "自己的日报" }, sheets: ["总表", "34(ROY)", "37(YC)"].map((title, index) => ({ properties: { sheetId: index + 1, title } })) };
+    ? { properties: { title: "甲方逐链日报" }, sheets: ["汇总", "SS1-34(ROY)", "MMY-XIONG-SS1-37(YC)"].map((title, index) => ({ properties: { sheetId: index + 1, title, hidden: title === "SS1-34(ROY)" } })) }
+    : { properties: { title: "自己的日报" }, sheets: ["总表", "34(ROY)", "37(YC)"].map((title, index) => ({ properties: { sheetId: index + 1, title, hidden: title === "34(ROY)" } })) };
   const deps = {
     getWorkbook: async (id) => workbook(id),
     getSheetValues: async (id, sheet) => values.get(`${id}:${sheet}`) || [],
@@ -206,9 +235,9 @@ test("reads one client chain per visible sheet and maps it by chain identity", a
   const pair = { id: "single-sheet-pair", name: "逐链配对", client: { spreadsheetId: clientId, gid: "1" }, own: { spreadsheetId: ownId }, targetSheet: "总表" };
   const preview = await collectScenario2Pair(pair, "2026-08-13", deps);
   assert.equal(preview.sourceSheet, "多链独立工作表");
-  assert.equal(preview.rows.length, 4);
+  assert.equal(preview.rows.length, 2);
   assert.ok(preview.rows.every((row) => row.status === "ready"));
-  assert.deepEqual([...new Set(preview.rows.map((row) => row.routeKey))].sort(), ["34", "37"]);
+  assert.deepEqual([...new Set(preview.rows.map((row) => row.routeKey))].sort(), ["37"]);
 });
 
 test("rejects a standalone chain sheet when the requested date is absent", () => {

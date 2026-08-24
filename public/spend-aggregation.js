@@ -59,6 +59,26 @@ export function shooterBusinessDates(scenarios) {
     .map((run) => String(run.businessDate))))].sort((a, b) => b.localeCompare(a));
 }
 
+function splitShelfPackRow(row) {
+  const details = Array.isArray(row.packageDetails) ? row.packageDetails : [];
+  if (!details.length) return [row];
+  const packages = new Map();
+  for (const detail of details) {
+    const packageName = String(detail.packageName || "").trim();
+    const value = Number(detail.value);
+    if (!packageName || !Number.isFinite(value)) continue;
+    const current = packages.get(packageName) || { packageName, value: 0 };
+    current.value += value;
+    packages.set(packageName, current);
+  }
+  if (!packages.size) return [row];
+  return [...packages.values()].map(({ packageName, value }) => ({
+    ...row,
+    sourceValue: value,
+    packageDetails: [{ packageName, metric: row.metric, value }]
+  }));
+}
+
 export function shooterSpendRows(scenarios, businessDate = "") {
   const snapshots = spendScenarios.flatMap((scenario) =>
     latestDataResults(scenarios, scenario, businessDate).map(({ run, result }) => ({ scenario, run, result }))
@@ -69,15 +89,18 @@ export function shooterSpendRows(scenarios, businessDate = "") {
     const channelGroup = displayChannelGroup(result, scenario, scenarios);
     if (!channelGroup) continue;
     for (const row of result.rows || []) {
-      const entry = spendEntry(row);
-      if (!entry) continue;
-      const chain = displayChain(row);
-      if (!chain || chain === "未识别") continue;
-      const shooter = displayShooter(row);
-      const key = `${channelGroup}\u0000${shooter}\u0000${chain}`;
-      const current = groups.get(key) || { channelGroup, shooter, chain, spend: 0, returnSpend: 0 };
-      current[entry.metric] += entry.value;
-      groups.set(key, current);
+      const sourceRows = scenario === "scenario-3" ? splitShelfPackRow(row) : [row];
+      for (const sourceRow of sourceRows) {
+        const entry = spendEntry(sourceRow);
+        if (!entry) continue;
+        const chain = displayChain(sourceRow);
+        if (!chain || chain === "未识别") continue;
+        const shooter = displayShooter(sourceRow);
+        const key = `${channelGroup}\u0000${shooter}\u0000${chain}`;
+        const current = groups.get(key) || { channelGroup, shooter, chain, spend: 0, returnSpend: 0 };
+        current[entry.metric] += entry.value;
+        groups.set(key, current);
+      }
     }
   }
   return { runs, rows: [...groups.values()].sort((a, b) => a.shooter.localeCompare(b.shooter, "zh-CN") || a.chain.localeCompare(b.chain, "zh-CN", { numeric: true })) };

@@ -1,6 +1,6 @@
 import { batchWrite, getSheetValues, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
 import { mapConcurrent } from "./async-utils.mjs";
-import { columnName, combineTargetStatuses as combineStatus, dateKey, inspectTarget as inspectSpreadsheetTarget, isEmpty as empty, parseNumber as parseSpreadsheetNumber } from "./spreadsheet-utils.mjs";
+import { combineTargetStatuses as combineStatus, dateKey, inspectTarget as inspectSpreadsheetTarget, isEmpty as empty, parseNumber as parseSpreadsheetNumber, quoteSheetTitle, sheetRange } from "./spreadsheet-utils.mjs";
 import { looseRouteScore, normalizeRoute, normalizeScenarioText as normalized, routeIdentity, routeScore, shooterFallbackScore, totalChainScore } from "./scenario2-route.mjs";
 
 export { dateKey } from "./spreadsheet-utils.mjs";
@@ -44,8 +44,13 @@ function findFieldColumn(cells, field) {
   return best.column;
 }
 
-function sheetRange(sheet, row, column) {
-  return `'${sheet.replaceAll("'", "''")}'!${columnName(column)}${row + 1}`;
+function findFieldColumns(cells) {
+  return {
+    date: findFieldColumn(cells, "date"),
+    channel: findFieldColumn(cells, "channel"),
+    spend: findFieldColumn(cells, "spend"),
+    returnSpend: findFieldColumn(cells, "returnSpend")
+  };
 }
 
 function roundMoney(value) {
@@ -136,21 +141,23 @@ export function extractBigCellRecords(values, businessDate, sourceSheet = "甲�
 function findHeaders(values) {
   const headers = [];
   for (let row = 0; row < values.length; row += 1) {
-    const cells = values[row] || [];
-    const date = findFieldColumn(cells, "date");
-    const channel = findFieldColumn(cells, "channel");
-    const spend = findFieldColumn(cells, "spend");
-    const returnSpend = findFieldColumn(cells, "returnSpend");
-    if (date >= 0 && channel >= 0 && (spend >= 0 || returnSpend >= 0)) {
+    const { date, channel, spend, returnSpend } = findFieldColumns(values[row] || []);
+    if (date >= 0 && channel >= 0) {
       headers.push({ row, date, channel, spend, returnSpend });
     }
   }
   return headers;
 }
 
-function metricRecord(channel, route, metric, parsed, sourceSheet, row, column) {
+function metricRecord(channel, route, metric, parsed, sourceSheet, row, column, missingColumnStatus = "blank") {
   const identity = { channel, routeCode: route.code, routeChain: routeIdentity(route), shooter: route.shooter, metric, sourceSheet };
-  if (column < 0) return { ...identity, status: "error", message: `甲方表缺少${metric}列` };
+  if (column < 0) {
+    const error = missingColumnStatus === "error";
+    const message = error
+      ? (parsed.kind === "error" ? parsed.raw : `甲方表缺少${metric}列`)
+      : "甲方源单元格为空，已跳过";
+    return { ...identity, status: error ? "error" : "blank", message };
+  }
   if (parsed.kind === "blank") return { ...identity, status: "blank", message: "甲方源单元格为空，已跳过" };
   if (parsed.kind === "error") return { ...identity, status: "error", message: `甲方源值不是数字：${parsed.raw}` };
   return {
@@ -198,11 +205,8 @@ export function extractClientRecords(values, businessDate, sourceSheet = "甲方
 function findStandaloneHeaders(values) {
   const headers = [];
   for (let row = 0; row < values.length; row += 1) {
-    const cells = values[row] || [];
-    const date = findFieldColumn(cells, "date");
-    const spend = findFieldColumn(cells, "spend");
-    const returnSpend = findFieldColumn(cells, "returnSpend");
-    if (date >= 0 && (spend >= 0 || returnSpend >= 0)) headers.push({ row, date, channel: findFieldColumn(cells, "channel"), spend, returnSpend });
+    const { date, channel, spend, returnSpend } = findFieldColumns(values[row] || []);
+    if (date >= 0 && (spend >= 0 || returnSpend >= 0)) headers.push({ row, date, channel, spend, returnSpend });
   }
   return headers;
 }
@@ -274,8 +278,8 @@ export function extractStandaloneChainRecords(values, businessDate, sourceSheet,
   const fallback = rows.length ? rows : standaloneBigCellRecords(values, businessDate, sourceSheet, routeHint);
   if (!fallback.length) {
     return [
-      metricRecord(routeHint.raw, routeHint, "消耗", { kind: "error", raw: `缺少 ${businessDate} 日期记录` }, sourceSheet, -1, -1),
-      metricRecord(routeHint.raw, routeHint, "回流消耗", { kind: "error", raw: `缺少 ${businessDate} 日期记录` }, sourceSheet, -1, -1)
+      metricRecord(routeHint.raw, routeHint, "消耗", { kind: "error", raw: `缺少 ${businessDate} 日期记录` }, sourceSheet, -1, -1, "error"),
+      metricRecord(routeHint.raw, routeHint, "回流消耗", { kind: "error", raw: `缺少 ${businessDate} 日期记录` }, sourceSheet, -1, -1, "error")
     ];
   }
   return markDuplicateRecords(fallback);
@@ -283,11 +287,7 @@ export function extractStandaloneChainRecords(values, businessDate, sourceSheet,
 
 function findDetailHeader(values) {
   for (let row = 0; row < Math.min(values.length, 16); row += 1) {
-    const cells = values[row] || [];
-    const date = findFieldColumn(cells, "date");
-    const channel = findFieldColumn(cells, "channel");
-    const spend = findFieldColumn(cells, "spend");
-    const returnSpend = findFieldColumn(cells, "returnSpend");
+    const { date, channel, spend, returnSpend } = findFieldColumns(values[row] || []);
     if (date >= 0 && channel >= 0 && (spend >= 0 || returnSpend >= 0)) return { row, date, channel, spend, returnSpend };
   }
   return null;
@@ -315,10 +315,11 @@ function chooseDetailSheet(descriptors, row) {
 }
 
 function detailDescriptors(ownWorkbook, targetSheet = "总表") {
-  const visible = ownWorkbook.sheets.filter(({ properties }) => !properties.hidden).map(({ properties }) => properties);
+  const visible = ownWorkbook.sheets
+    .filter(({ properties }) => !properties.hidden)
+    .map(({ properties }) => properties);
   const total = visible.find((sheet) => sheet.title === targetSheet);
   return {
-    visible,
     totalSheet: total,
     details: visible
       .filter((sheet) => sheet.title !== total?.title)
@@ -344,11 +345,10 @@ function chooseClientChainSheet(clientSheets, descriptor) {
 }
 
 async function collectChainSheetRecords(pair, businessDate, clientSheets, ownDescriptors, deps) {
-  const candidateSheets = clientSheets;
   const matchCache = new Map();
   const getMatch = (descriptor) => {
     const key = descriptor.sheet.title;
-    if (!matchCache.has(key)) matchCache.set(key, chooseClientChainSheet(candidateSheets, descriptor));
+    if (!matchCache.has(key)) matchCache.set(key, chooseClientChainSheet(clientSheets, descriptor));
     return matchCache.get(key);
   };
   const hasChainSheets = ownDescriptors.details.some((descriptor) => getMatch(descriptor).sheet);
@@ -362,8 +362,8 @@ async function collectChainSheetRecords(pair, businessDate, clientSheets, ownDes
     const match = getMatch(descriptor);
     if (match.error) {
       rows.push(
-        metricRecord(descriptor.sheet.title, descriptor.route, "消耗", { kind: "error", raw: match.error }, descriptor.sheet.title, -1, -1),
-        metricRecord(descriptor.sheet.title, descriptor.route, "回流消耗", { kind: "error", raw: match.error }, descriptor.sheet.title, -1, -1)
+        metricRecord(descriptor.sheet.title, descriptor.route, "消耗", { kind: "error", raw: match.error }, descriptor.sheet.title, -1, -1, "error"),
+        metricRecord(descriptor.sheet.title, descriptor.route, "回流消耗", { kind: "error", raw: match.error }, descriptor.sheet.title, -1, -1, "error")
       );
       continue;
     }
@@ -419,7 +419,7 @@ function locateTotal(values, businessDate) {
 async function readSheetMap(spreadsheetId, titles, deps, options = {}) {
   const uniqueTitles = [...new Set(titles)];
   if (deps.getSheetValuesBatch) {
-    const ranges = uniqueTitles.map((title) => `'${title.replaceAll("'", "''")}'`);
+    const ranges = uniqueTitles.map(quoteSheetTitle);
     const values = await deps.getSheetValuesBatch(spreadsheetId, ranges, options);
     return new Map(uniqueTitles.map((title, index) => [title, values[index] || []]));
   }
@@ -538,7 +538,9 @@ export async function collectScenario2Pair(pair, businessDate, deps = defaultDep
     deps.getWorkbook(pair.client.spreadsheetId),
     deps.getWorkbook(pair.own.spreadsheetId)
   ]);
-  const clientSheets = clientWorkbook.sheets.filter(({ properties }) => !properties.hidden).map(({ properties }) => properties);
+  const clientSheets = clientWorkbook.sheets
+    .filter(({ properties }) => !properties.hidden)
+    .map(({ properties }) => properties);
   if (!clientSheets.length) throw new Error("甲方日报表没有可读取的页签");
   const ownDescriptors = detailDescriptors(ownWorkbook, pair.targetSheet || "总表");
   let sourceRows = await collectChainSheetRecords(pair, businessDate, clientSheets, ownDescriptors, deps);

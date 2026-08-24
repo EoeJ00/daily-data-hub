@@ -1,6 +1,6 @@
 import { batchWrite, getSheetValues, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
 import { mapConcurrent } from "./async-utils.mjs";
-import { columnName, combineTargetStatuses as combineStatus, dateKey, inspectTarget, isEmpty as empty, normalizeText as normalized, parseNumber } from "./spreadsheet-utils.mjs";
+import { combineTargetStatuses as combineStatus, dateKey, inspectTarget, isEmpty as empty, normalizeText as normalized, parseNumber, parseSheetRange, quoteSheetTitle, sheetRange } from "./spreadsheet-utils.mjs";
 
 export { dateKey } from "./spreadsheet-utils.mjs";
 const compact = (value) => normalized(value).replace(/[\-_—–（）()]/g, "");
@@ -9,12 +9,23 @@ function headerText(value) {
   return normalized(value).replace(/[\n\r]/g, "");
 }
 
+function findMetricColumn(cells, metric) {
+  const exactPattern = metric === "spend"
+    ? /^(?:消耗|花费)(?:（[^）]*）|\([^)]*\))?$/
+    : /^回流(?:消耗)?(?:（[^）]*）|\([^)]*\))?$/;
+  const exact = cells.findIndex((cell) => exactPattern.test(headerText(cell)));
+  if (exact >= 0) return exact;
+  return cells.findIndex((cell) => metric === "spend"
+    ? /消耗|花费/.test(String(cell ?? "")) && !/回流/.test(String(cell ?? ""))
+    : /回流消耗|回流/.test(String(cell ?? "")));
+}
+
 function findHeader(values, kind) {
   for (let row = 0; row < Math.min(values.length, 24); row += 1) {
     const cells = values[row] || [];
     const date = cells.findIndex((cell) => headerText(cell) === "日期" || headerText(cell) === "时间" || headerText(cell) === "date");
-    const spend = cells.findIndex((cell) => /消耗/.test(String(cell ?? "")) && !/回流/.test(String(cell ?? "")));
-    const returnSpend = cells.findIndex((cell) => /回流消耗|回流/.test(String(cell ?? "")));
+    const spend = findMetricColumn(cells, "spend");
+    const returnSpend = findMetricColumn(cells, "returnSpend");
     const name = cells.findIndex((cell) => kind === "rack"
       ? /投手|包名/.test(String(cell ?? ""))
       : /渠道名|渠道/.test(String(cell ?? "")));
@@ -109,25 +120,6 @@ function locateDateRow(values, header, businessDate) {
   return values.findIndex((row, index) => index > header.row && dateKey(row?.[header.date], businessDate) === businessDate);
 }
 
-function parseCellRange(range) {
-  const separator = range.lastIndexOf("!");
-  if (separator < 0) return null;
-  const sheetPart = range.slice(0, separator);
-  const cell = range.slice(separator + 1);
-  const title = sheetPart.startsWith("'") && sheetPart.endsWith("'")
-    ? sheetPart.slice(1, -1).replaceAll("''", "'")
-    : sheetPart;
-  const match = cell.match(/^([A-Z]+)(\d+)$/i);
-  if (!match) return null;
-  const column = [...match[1].toUpperCase()].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
-  return { title, cell, row: Number(match[2]) - 1, column };
-}
-
-function targetMetricColumns(values, header) {
-  const row = values[header.row] || [];
-  return { spend: header.spend, returnSpend: header.returnSpend, row };
-}
-
 function findTotalHeader(values) {
   for (let row = 0; row < Math.min(values.length, 24); row += 1) {
     const cells = values[row] || [];
@@ -140,12 +132,25 @@ function findTotalHeader(values) {
 
 function locateTotalMetricColumn(values, header, shooter, metric) {
   const aliases = new Set(shooterAliases(shooter));
-  const matches = [];
   const cells = values[header.row] || [];
+  const shooterColumns = cells
+    .map((cell, column) => ({ text: compact(cell), column }))
+    .filter(({ text }) => aliases.has(text) || aliases.has(text.replace(/消耗$|花费$/, "")))
+    .map(({ column }) => column);
+
+  if (metric === "回流消耗") {
+    const adjacentMatches = shooterColumns
+      .map((column) => column + 1)
+      .filter((column) => column < cells.length);
+    if (adjacentMatches.length === 1) return { column: adjacentMatches[0] };
+    if (adjacentMatches.length > 1) return { error: `总表中投手 ${shooter} 的${metric}列不唯一` };
+  }
+
+  const matches = [];
   cells.forEach((cell, column) => {
     const text = compact(cell);
     const isReturn = /回流消耗|回流/.test(text);
-    const base = text.replace(/回流消耗$|回流$/, "");
+    const base = text.replace(/回流消耗$|回流$|消耗$|花费$/, "");
     if (!aliases.has(base)) return;
     if ((metric === "消耗" && !isReturn) || (metric === "回流消耗" && isReturn)) matches.push(column);
   });
@@ -192,7 +197,6 @@ export function aggregateShelfPackRows(results) {
 }
 
 function mapShelfTargets(records, businessDate, targetSheets, totalSheet) {
-  const targetCache = new Map(targetSheets.map((sheet) => [sheet.title, sheet]));
   const totalHeader = findTotalHeader(totalSheet.values);
   const rows = [];
   for (const record of records) {
@@ -212,7 +216,7 @@ function mapShelfTargets(records, businessDate, targetSheets, totalSheet) {
         rows.push({ ...base, message: match.error });
         continue;
       }
-      const target = targetCache.get(match.title);
+      const target = match;
       const header = findHeader(target.values, "shooter");
       const dateRow = header ? locateDateRow(target.values, header, businessDate) : -1;
       let detail;
@@ -221,9 +225,8 @@ function mapShelfTargets(records, businessDate, targetSheets, totalSheet) {
       } else if (dateRow < 0) {
         detail = { status: "error", message: `投手消耗表缺少 ${businessDate} 日期行` };
       } else {
-        const columns = targetMetricColumns(target.values, header);
-        const column = metric === "消耗" ? columns.spend : columns.returnSpend;
-        const range = `'${target.title.replaceAll("'", "''")}'!${columnName(column)}${dateRow + 1}`;
+        const column = metric === "消耗" ? header.spend : header.returnSpend;
+        const range = sheetRange(target.title, dateRow, column);
         const inspection = inspectTarget(target.values[dateRow]?.[column], sourceValue, range);
         detail = { ...inspection, range };
       }
@@ -240,7 +243,7 @@ function mapShelfTargets(records, businessDate, targetSheets, totalSheet) {
           if (located.error) {
             total = { status: "error", message: located.error };
           } else {
-            const range = `'${totalSheet.title.replaceAll("'", "''")}'!${columnName(located.column)}${totalDateRow + 1}`;
+            const range = sheetRange(totalSheet.title, totalDateRow, located.column);
             total = { ...inspectTarget(totalSheet.values[totalDateRow]?.[located.column], sourceValue, range), range };
           }
         }
@@ -267,7 +270,7 @@ function mapShelfTargets(records, businessDate, targetSheets, totalSheet) {
 async function readShelfSheets(spreadsheetId, properties, deps) {
   const titles = properties.map((sheet) => sheet.title);
   if (deps.getSheetValuesBatch) {
-    const ranges = titles.map((title) => `'${title.replaceAll("'", "''")}'`);
+    const ranges = titles.map(quoteSheetTitle);
     const values = await deps.getSheetValuesBatch(spreadsheetId, ranges);
     return properties.map((sheet, index) => ({ ...sheet, values: values[index] || [] }));
   }
@@ -320,14 +323,14 @@ async function verifyShelfWrites(book, preview, updates, deps) {
     ranges.forEach((range, index) => valuesByRange.set(range, values[index] || []));
   } else {
     await Promise.all(ranges.map(async (range) => {
-      const parsed = parseCellRange(range);
+      const parsed = parseSheetRange(range);
       if (!parsed) return;
       const values = await deps.getSheetValues(book.spreadsheetId, parsed.title, { range: parsed.cell });
       valuesByRange.set(range, values);
     }));
   }
   const readValue = (range) => {
-    const parsed = parseCellRange(range);
+    const parsed = parseSheetRange(range);
     const values = valuesByRange.get(range) || [];
     if (values.length === 1 && values[0]?.length === 1) return values[0][0];
     return parsed ? values[parsed.row]?.[parsed.column] : undefined;

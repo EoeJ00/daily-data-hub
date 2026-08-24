@@ -1,5 +1,5 @@
 import { batchWrite, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
-import { columnName, isEmpty as empty, normalizeText as normalized, parseNumber } from "./spreadsheet-utils.mjs";
+import { dateKey, isEmpty as empty, normalizeText as normalized, parseNumber, quoteSheetTitle, sheetRange } from "./spreadsheet-utils.mjs";
 
 function channelColumnName(channel) {
   const displayName = String(channel ?? "").trim();
@@ -9,20 +9,6 @@ function channelColumnName(channel) {
 function matches(value, aliases) {
   const target = normalized(value);
   return aliases.some((alias) => target === normalized(alias));
-}
-
-function dateKey(value) {
-  if (value instanceof Date) return value.toISOString().slice(0, 10);
-  if (typeof value === "number") {
-    const epoch = Date.UTC(1899, 11, 30);
-    return new Date(epoch + value * 86_400_000).toISOString().slice(0, 10);
-  }
-  const text = String(value ?? "").trim().replace(/[年月/.]/g, "-").replace("日", "");
-  const match = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
-  if (match) return `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}`;
-  const short = text.match(/^(\d{1,2})-(\d{1,2})$/);
-  if (short) return `${new Date().getFullYear()}-${short[1].padStart(2, "0")}-${short[2].padStart(2, "0")}`;
-  return "";
 }
 
 function findSourceHeader(values, aliases) {
@@ -40,7 +26,7 @@ function extractChannel(values, source, channel, businessDate) {
   const header = findSourceHeader(values, source.aliases);
   const targetChannel = channelColumnName(channel);
   if (!header) return [{ channel, targetChannel, metric: "结构", status: "error", message: "未找到日期/消耗表头" }];
-  const matchesDate = values.slice(header.row + 1).filter((row) => dateKey(row[header.date]) === businessDate);
+  const matchesDate = values.slice(header.row + 1).filter((row) => dateKey(row[header.date], businessDate) === businessDate);
   if (!matchesDate.length) return [{ channel, targetChannel, metric: "日期", status: "error", message: `缺少 ${businessDate} 记录` }];
   return [
     aggregateMetric(matchesDate, header.spend, channel, "消耗"),
@@ -62,7 +48,7 @@ function locateTarget(values, businessDate) {
   for (let row = 0; row < Math.min(values.length, 12); row += 1) {
     const dateColumn = (values[row] || []).findIndex((cell) => matches(cell, ["日期", "时间", "date"]));
     if (dateColumn < 0) continue;
-    const dateRow = values.findIndex((cells, index) => index > row && dateKey(cells[dateColumn]) === businessDate);
+    const dateRow = values.findIndex((cells, index) => index > row && dateKey(cells[dateColumn], businessDate) === businessDate);
     return { headerRow: row, dateRow };
   }
   return null;
@@ -99,7 +85,7 @@ function mapRows(rows, targetValues, target, targetSheet) {
     }
     if (column < 0) return { ...row, targetChannel, status: "error", message: `总表未找到渠道指标列（匹配键：${targetChannel}）` };
     const targetValue = targetValues[target.dateRow]?.[column];
-    const range = `'${targetSheet.replaceAll("'", "''")}'!${columnName(column)}${target.dateRow + 1}`;
+    const range = sheetRange(targetSheet, target.dateRow, column);
     if (empty(targetValue)) return { ...row, targetChannel, status: "ready", targetValue: null, range };
     const parsed = parseNumber(targetValue);
     if (parsed.kind === "number" && parsed.value === row.sourceValue) return { ...row, targetChannel, status: "same", targetValue: parsed.value, range, message: "目标值已一致" };
@@ -117,7 +103,7 @@ export async function collectWorkbook(source, businessDate, deps = defaultDeps) 
   if (!visibleSheets.includes(source.targetSheet)) throw new Error(`未找到目标页签：${source.targetSheet}`);
   const channels = visibleSheets.filter((title) => !source.excludedSheets.includes(title));
   const titles = [...new Set([source.targetSheet, ...channels])];
-  const ranges = titles.map((title) => `'${title.replaceAll("'", "''")}'`);
+  const ranges = titles.map(quoteSheetTitle);
   const values = await deps.getSheetValuesBatch(source.spreadsheetId, ranges);
   const valuesByTitle = new Map(titles.map((title, index) => [title, values[index] || []]));
   const targetValues = valuesByTitle.get(source.targetSheet) || [];

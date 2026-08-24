@@ -36,6 +36,28 @@ export function columnName(index) {
   return name;
 }
 
+export function quoteSheetTitle(title) {
+  return `'${String(title ?? "").replaceAll("'", "''")}'`;
+}
+
+export function sheetRange(title, row, column) {
+  return `${quoteSheetTitle(title)}!${columnName(column)}${row + 1}`;
+}
+
+export function parseSheetRange(range) {
+  const separator = String(range ?? "").lastIndexOf("!");
+  if (separator < 0) return null;
+  const sheetPart = range.slice(0, separator);
+  const cell = range.slice(separator + 1);
+  const title = sheetPart.startsWith("'") && sheetPart.endsWith("'")
+    ? sheetPart.slice(1, -1).replaceAll("''", "'")
+    : sheetPart;
+  const match = cell.match(/^([A-Z]+)(\d+)$/i);
+  if (!match) return null;
+  const column = [...match[1].toUpperCase()].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
+  return { title, cell, row: Number(match[2]) - 1, column };
+}
+
 export function inspectTarget(value, sourceValue, range, parse = parseNumber) {
   if (isEmpty(value)) return { status: "ready", value: null, range };
   const parsed = parse(value);

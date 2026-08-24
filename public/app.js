@@ -247,6 +247,27 @@ function setLoading(button, loading) {
   button.classList.toggle("loading", loading);
 }
 
+function bindDrawerControls(drawer, openSelector, closeSelector) {
+  content.querySelector(openSelector)?.addEventListener("click", () => drawer?.showModal());
+  content.querySelectorAll(closeSelector).forEach((button) => button.addEventListener("click", () => drawer?.close()));
+}
+
+function bindSearchRows(inputSelector, rowSelector = "[data-search-row]") {
+  content.querySelector(inputSelector)?.addEventListener("input", (event) => {
+    const query = event.target.value.trim().toLowerCase();
+    content.querySelectorAll(rowSelector).forEach((row) => {
+      row.hidden = Boolean(query && !row.dataset.searchRow.includes(query));
+    });
+  });
+}
+
+function bindRunDetailRows(scenario, runs) {
+  content.querySelectorAll("[data-run-detail]").forEach((row) => row.addEventListener("click", () => {
+    const run = runs.find((item) => item.id === row.dataset.runDetail);
+    if (run) openRunDetail(scenario, run);
+  }));
+}
+
 function metric(label, value, contextText) {
   return `<article class="metric-card"><span class="metric-label">${label}</span><strong class="metric-value">${formatNumber(value)}</strong><span class="metric-context">${contextText}</span></article>`;
 }
@@ -285,7 +306,7 @@ function renderOverview() {
         <li>${icons.check}<span><strong>重复执行：</strong>相同值直接跳过，避免重复写入。</span></li>
       </ul></div>
     </section>`;
-  content.querySelectorAll("[data-run-detail]").forEach((row) => row.addEventListener("click", () => { const run = primary.runs.find((item) => item.id === row.dataset.runDetail); if (run) openRunDetail("scenario-1", run); }));
+  bindRunDetailRows("scenario-1", primary.runs);
 }
 
 function renderSources() {
@@ -301,8 +322,7 @@ function renderSources() {
     </section>
     <dialog id="sourceImportDrawer" class="detail-drawer-dialog config-drawer" aria-labelledby="sourceImportTitle"><div class="detail-drawer-card"><button class="detail-close" type="button" data-close-source-import aria-label="关闭添加工作簿">×</button><div class="detail-kicker">单表</div><h2 id="sourceImportTitle">添加工作簿</h2><p>支持批量粘贴链接，每行一个。</p><div class="drawer-form"><label>工作簿名<input id="sourceName" placeholder="例如：7W"></label><label for="linkInput">Google 表格链接<textarea id="linkInput" placeholder="渠道名 | https://docs.google.com/spreadsheets/d/.../edit#gid=0&#10;https://docs.google.com/spreadsheets/d/.../edit?gid=123"></textarea></label><div id="linkPreview" class="paste-preview" aria-live="polite">等待粘贴链接</div><div class="drawer-actions"><button class="button secondary" type="button" data-close-source-import>取消</button><button class="button primary" id="importButton" type="button">${icons.sheet}导入配置</button></div></div></div></dialog>`;
   const drawer = content.querySelector("#sourceImportDrawer");
-  content.querySelector("[data-open-source-import]")?.addEventListener("click", () => drawer?.showModal());
-  content.querySelectorAll("[data-close-source-import]").forEach((button) => button.addEventListener("click", () => drawer?.close()));
+  bindDrawerControls(drawer, "[data-open-source-import]", "[data-close-source-import]");
   content.querySelector("#importButton")?.addEventListener("click", importSources);
   content.querySelector("#linkInput")?.addEventListener("input", (event) => {
     const lines = event.target.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
@@ -311,22 +331,17 @@ function renderSources() {
     if (preview) preview.textContent = lines.length > 1 && customName ? "批量导入请使用“名称 | 链接”格式；自定义名称仅适用于单个链接。" : lines.length ? `已识别 ${lines.length} 行链接，提交后自动解析名称与表格 ID。` : "等待粘贴链接";
   });
   content.querySelector("#sourceName")?.addEventListener("input", () => content.querySelector("#linkInput")?.dispatchEvent(new Event("input")));
-  content.querySelector("#sourceSearch")?.addEventListener("input", (event) => {
-    const query = event.target.value.trim().toLowerCase();
-    content.querySelectorAll("[data-search-row]").forEach((row) => { row.hidden = query && !row.dataset.searchRow.includes(query); });
-  });
+  bindSearchRows("#sourceSearch");
   content.querySelectorAll("[data-toggle]").forEach((button) => button.addEventListener("click", toggleSource));
   content.querySelectorAll("[data-delete]").forEach((button) => button.addEventListener("click", deleteSource));
   bindInlineNameEditing();
 }
 
-function renderSourceTable(scenario = "scenario-1") {
-  const sources = scenarioData(scenario).sources;
-  const scenarioLabel = "单表";
-  const secondColumn = "目标页签";
+function renderSourceTable() {
+  const sources = scenarioData("scenario-1").sources;
   if (!sources.length) return `<div class="empty-state">${icons.sheet}<h3>尚未导入工作簿</h3><p>可一次粘贴多个 Google 表格链接，系统会分别建立独立配置。</p></div>`;
-  return `<div class="table-wrap"><table><thead><tr><th>工作簿</th><th>${secondColumn}</th><th>情景</th><th>启用</th><th><span class="sr-only">操作</span></th></tr></thead><tbody>${sources.map((source) => `
-    <tr data-search-row="${escapeHtml(`${source.name} ${source.spreadsheetId || ""} ${source.targetSheet || ""}`.toLowerCase())}"><td class="name-cell source-row" data-source-row="${source.id}" data-name-row data-name-scenario="scenario-1" data-name-collection="sources" data-name-key="source">${editableNameMarkup(source)}<small class="name-url">${escapeHtml(source.spreadsheetId || source.url)}</small></td><td>${escapeHtml(source.targetSheet || "—")}</td><td><span class="badge neutral">${scenarioLabel}</span></td><td><button class="toggle ${source.enabled ? "on" : ""}" data-toggle="${source.id}" role="switch" aria-checked="${source.enabled}" aria-label="${source.enabled ? "停用" : "启用"}${escapeHtml(source.name)}"></button></td><td><div class="actions"><a class="button small secondary" href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">打开</a><button class="button small danger" data-delete="${source.id}">移除</button></div></td></tr>`).join("")}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>工作簿</th><th>目标页签</th><th>情景</th><th>启用</th><th><span class="sr-only">操作</span></th></tr></thead><tbody>${sources.map((source) => `
+    <tr data-search-row="${escapeHtml(`${source.name} ${source.spreadsheetId || ""} ${source.targetSheet || ""}`.toLowerCase())}"><td class="name-cell source-row" data-source-row="${source.id}" data-name-row data-name-scenario="scenario-1" data-name-collection="sources" data-name-key="source">${editableNameMarkup(source)}<small class="name-url">${escapeHtml(source.spreadsheetId || source.url)}</small></td><td>${escapeHtml(source.targetSheet || "—")}</td><td><span class="badge neutral">单表</span></td><td><button class="toggle ${source.enabled ? "on" : ""}" data-toggle="${source.id}" role="switch" aria-checked="${source.enabled}" aria-label="${source.enabled ? "停用" : "启用"}${escapeHtml(source.name)}"></button></td><td><div class="actions"><a class="button small secondary" href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">打开</a><button class="button small danger" data-delete="${source.id}">移除</button></div></td></tr>`).join("")}</tbody></table></div>`;
 }
 
 function shooterBusinessDates() {
@@ -357,7 +372,7 @@ function selectedShooterDate() {
   return selected;
 }
 
-function recentDateRange(endDate, count = 5) {
+function recentDateRange(endDate, count = 10) {
   const end = parseDateValue(endDate);
   if (!end) return [];
   return Array.from({ length: count }, (_, index) => {
@@ -452,13 +467,13 @@ function renderChannelSpendPanel() {
   const channelTotals = summarizeSpendRows(allSummaries.flatMap((summary) => summary.details), "channelGroup");
   const channelNames = channelTotals.map((summary) => summary.channelGroup);
   const empty = `<div class="empty-state">${icons.empty}<h3>暂无渠道消耗数据</h3></div>`;
-  const body = channelNames.length ? `<div class="table-wrap channel-matrix-wrap"><table class="channel-matrix"><caption class="sr-only">截至 ${escapeHtml(selectedDate)} 最近五天的渠道总消耗</caption><thead><tr><th class="channel-matrix-date" scope="col">日期</th>${channelNames.map((name) => `<th scope="col">${escapeHtml(name)}</th>`).join("")}</tr></thead><tbody>${dailySummaries.map((day) => `<tr class="${day.businessDate === selectedDate ? "is-selected" : ""}" ${day.businessDate === selectedDate ? 'aria-current="date"' : ""}><th class="channel-matrix-date" scope="row">${escapeHtml(day.businessDate)}</th>${channelNames.map((name) => {
+  const body = channelNames.length ? `<div class="table-wrap channel-matrix-wrap"><table class="channel-matrix"><caption class="sr-only">截至 ${escapeHtml(selectedDate)} 最近十天的渠道总消耗</caption><thead><tr><th class="channel-matrix-date" scope="col">日期</th>${channelNames.map((name) => `<th scope="col">${escapeHtml(name)}</th>`).join("")}</tr></thead><tbody>${dailySummaries.map((day) => `<tr class="${day.businessDate === selectedDate ? "is-selected" : ""}" ${day.businessDate === selectedDate ? 'aria-current="date"' : ""}><th class="channel-matrix-date" scope="row">${escapeHtml(day.businessDate)}</th>${channelNames.map((name) => {
     const summary = day.lookup.get(name);
     return summary
       ? `<td><button class="channel-matrix-value" type="button" data-channel-open="${escapeHtml(summary.detailKey)}" aria-haspopup="dialog" aria-label="查看 ${escapeHtml(name)} ${escapeHtml(day.businessDate)} 链名消耗">${formatNumber(summary.total)}</button></td>`
       : `<td class="channel-matrix-empty" aria-label="无记录">—</td>`;
   }).join("")}</tr>`).join("")}</tbody></table></div>` : empty;
-  content.innerHTML = `${spendSummaryMarkup("渠道", channelNames.length, data)}<section class="panel spend-panel"><div class="panel-header spend-panel-header"><div><h2>渠道五日消耗</h2></div><span class="badge neutral">最近 5 天</span></div>${body}</section>${spendDetailDialogMarkup("channel")}`;
+  content.innerHTML = `${spendSummaryMarkup("渠道", channelNames.length, data)}<section class="panel spend-panel"><div class="panel-header spend-panel-header"><div><h2>渠道十日消耗</h2></div><span class="badge neutral">最近 10 天</span></div>${body}</section>${spendDetailDialogMarkup("channel")}`;
   bindSpendDetail("channel", allSummaries);
 }
 
@@ -626,12 +641,6 @@ function renderRuns(scenario = "scenario-1") {
   }));
 }
 
-function renderPairTable(pairs) {
-  if (!pairs.length) return `<div class="empty-state">${icons.sheet}<h3>尚未配置日报配对</h3><p>添加甲方日报和对应的自己的日报表后，系统会在配对范围内识别渠道编号。</p></div>`;
-  return `<div class="table-wrap"><table><thead><tr><th>配对名称</th><th>甲方日报</th><th>自己的日报</th><th>状态</th><th><span class="sr-only">操作</span></th></tr></thead><tbody>${pairs.map((pair) => `
-    <tr data-search-row="${escapeHtml(`${pair.name} ${pair.client?.spreadsheetId || ""} ${pair.own?.spreadsheetId || ""}`.toLowerCase())}"><td><strong>${escapeHtml(pair.name)}</strong><small class="pair-note">按渠道编号匹配，目标页签：${escapeHtml(pair.targetSheet || "总表")}</small></td><td><a class="table-link" href="${escapeHtml(pair.client.url)}" target="_blank" rel="noreferrer">${escapeHtml(pair.client.name)}</a></td><td><a class="table-link" href="${escapeHtml(pair.own.url)}" target="_blank" rel="noreferrer">${escapeHtml(pair.own.name)}</a></td><td><button class="toggle ${pair.enabled ? "on" : ""}" data-pair-toggle="${pair.id}" role="switch" aria-checked="${pair.enabled}" aria-label="${pair.enabled ? "停用" : "启用"}${escapeHtml(pair.name)}"></button></td><td><div class="actions"><button class="button small danger" data-pair-delete="${pair.id}">移除</button></div></td></tr>`).join("")}</tbody></table></div>`;
-}
-
 function renderScenario2RunDetails(run) {
   return `<div class="table-wrap"><table><thead><tr><th>配对</th><th>渠道</th><th>投手页签</th><th>指标</th><th>源值</th><th>投手日报</th><th>总表</th><th>结果</th><th>说明</th></tr></thead><tbody>${(run.results || []).flatMap((result) => result.rows?.length ? result.rows.map((row) => `
     <tr data-run-detail="${escapeHtml(run.id)}"><td><strong>${escapeHtml(result.pairName)}</strong><small class="pair-note">${escapeHtml(result.sourceName)} → ${escapeHtml(result.targetName)}</small></td><td><div class="channel-cell"><strong>${escapeHtml(row.routeCode || row.channel)}</strong><small class="channel-target">${escapeHtml(row.channel)}</small></div></td><td>${escapeHtml(row.targetSheet || "—")}</td><td>${escapeHtml(row.metric)}</td><td>${formatNumber(row.sourceValue)}</td><td>${row.detail ? `${badge(row.detail.status)}<small class="pair-note">${formatNumber(row.detail.value)}</small>` : "—"}</td><td>${row.total ? `${badge(row.total.status)}<small class="pair-note">${formatNumber(row.total.value)}</small>` : "—"}</td><td>${badge(row.status)}</td><td>${escapeHtml(row.message || row.sourceRange || "—")}</td></tr>`) : [`<tr data-run-detail="${escapeHtml(run.id)}"><td>${escapeHtml(result.pairName || "日报配对")}</td><td colspan="7">${badge("failed")}</td><td>${escapeHtml(result.error || "未知错误")}</td></tr>`]).join("")}</tbody></table></div>`;
@@ -660,7 +669,7 @@ function renderScenario2Overview() {
         <li>${icons.check}<span><strong>缺少日期或渠道：</strong>保留异常记录，等待配置修正。</span></li>
       </ul></div>
     </section>`;
-  content.querySelectorAll("[data-run-detail]").forEach((row) => row.addEventListener("click", () => { const run = secondary.runs.find((item) => item.id === row.dataset.runDetail); if (run) openRunDetail("scenario-2", run); }));
+  bindRunDetailRows("scenario-2", secondary.runs);
 }
 
 function renderPairCards(pairs) {
@@ -673,13 +682,9 @@ function renderScenario2Config() {
   const drawerMarkup = '<dialog id="pairImportDrawer" class="detail-drawer-dialog config-drawer" aria-labelledby="pairImportTitle"><div class="detail-drawer-card"><button class="detail-close" type="button" data-close-pair-import aria-label="关闭添加配对">×</button><div class="detail-kicker">多表匹配</div><h2 id="pairImportTitle">添加日报配对</h2><p>为每个甲方日报配置一张自己的日报。</p><div class="drawer-form"><label>配对名称<input id="pairName" placeholder="例如：RS9"></label><label>甲方日报链接<input id="clientUrl" placeholder="https://docs.google.com/spreadsheets/d/..."></label><label>自己的日报链接<input id="ownUrl" placeholder="https://docs.google.com/spreadsheets/d/..."></label><div class="drawer-actions"><button class="button secondary" type="button" data-close-pair-import>取消</button><button class="button primary" id="addPairButton" type="button">' + icons.sheet + '添加配对</button></div></div></div></dialog>';
   content.innerHTML = '<section class="panel"><div class="panel-header"><div><h2>工作簿配置</h2></div><button class="button primary" type="button" data-open-pair-import>' + icons.sheet + '添加配对</button></div><div class="panel-body config-toolbar"><label class="search-field" for="pairSearch"><span class="sr-only">搜索配对</span><input id="pairSearch" type="search" placeholder="搜索配对名称或表格 ID" autocomplete="off"></label><span class="config-count">' + secondary.pairs.length + ' 组配对</span></div></section><section class="panel"><div class="panel-header"><div><h2>多表匹配日报配对</h2></div></div>' + renderPairCards(secondary.pairs) + '</section>' + drawerMarkup;
   const drawer = content.querySelector("#pairImportDrawer");
-  content.querySelector("[data-open-pair-import]")?.addEventListener("click", () => drawer?.showModal());
-  content.querySelectorAll("[data-close-pair-import]").forEach((button) => button.addEventListener("click", () => drawer?.close()));
+  bindDrawerControls(drawer, "[data-open-pair-import]", "[data-close-pair-import]");
   content.querySelector("#addPairButton")?.addEventListener("click", addPair);
-  content.querySelector("#pairSearch")?.addEventListener("input", (event) => {
-    const query = event.target.value.trim().toLowerCase();
-    content.querySelectorAll("[data-search-row]").forEach((row) => { row.hidden = query && !row.dataset.searchRow.includes(query); });
-  });
+  bindSearchRows("#pairSearch");
   content.querySelectorAll("[data-pair-toggle]").forEach((button) => button.addEventListener("click", togglePair));
   content.querySelectorAll("[data-pair-delete]").forEach((button) => button.addEventListener("click", deletePair));
   bindInlineNameEditing();
@@ -705,7 +710,7 @@ function renderScenario3Overview() {
       <div class="panel-header"><div><h2>最近一次架上包搬运结果</h2><p>${latest ? `${latest.businessDate} · ${latest.type === "run" ? "正式写入" : "预览"}` : "尚未执行任务"}</p></div>${latest ? `<span class="badge neutral">${new Date(latest.createdAt).toLocaleString("zh-CN")}</span>` : ""}</div>
       ${latest ? renderShelfRunDetails(latest) : `<div class="empty-state">${icons.sheet}<h3>等待首次预览</h3><p>系统会自动识别架上包记录表、投手消耗表和总表，再按投手汇总消耗与回流消耗。</p></div>`}
     </section>`;
-  content.querySelectorAll("[data-run-detail]").forEach((row) => row.addEventListener("click", () => { const run = shelf.runs.find((item) => item.id === row.dataset.runDetail); if (run) openRunDetail("scenario-3", run); }));
+  bindRunDetailRows("scenario-3", shelf.runs);
 }
 
 function renderShelfBookCards(books) {
@@ -718,13 +723,9 @@ function renderScenario3Config() {
   const drawerMarkup = `<dialog id="shelfBookDrawer" class="detail-drawer-dialog config-drawer" aria-labelledby="shelfBookTitle"><div class="detail-drawer-card"><button class="detail-close" type="button" data-close-shelf-book aria-label="关闭添加架上包工作簿">×</button><div class="detail-kicker">架上包</div><h2 id="shelfBookTitle">添加架上包工作簿</h2><p>系统会自动区分架上包记录表、投手消耗表和总表，汇总后写回对应投手页签及总表列。</p><div class="drawer-form"><label>工作簿名<input id="shelfBookName" placeholder="例如：架上包数据表"></label><label>Google 表格链接<input id="shelfBookUrl" placeholder="https://docs.google.com/spreadsheets/d/..."></label><div class="drawer-actions"><button class="button secondary" type="button" data-close-shelf-book>取消</button><button class="button primary" id="addShelfBookButton" type="button">${icons.sheet}添加工作簿</button></div></div></div></dialog>`;
   content.innerHTML = `<section class="panel"><div class="panel-header"><div><h2>架上包工作簿配置</h2><p>支持合并日期单元格；同一投手在多个架上包中的消耗会自动求和。</p></div><button class="button primary" type="button" data-open-shelf-book>${icons.sheet}添加工作簿</button></div><div class="panel-body config-toolbar"><label class="search-field" for="shelfBookSearch"><span class="sr-only">搜索架上包工作簿</span><input id="shelfBookSearch" type="search" placeholder="搜索工作簿名或表格 ID" autocomplete="off"></label><span class="config-count">${shelf.books.length} 张工作簿</span></div></section><section class="panel"><div class="panel-header"><div><h2>已配置工作簿</h2><p>执行时会优先读取可见架上包表；投手消耗表支持隐藏页签。</p></div></div>${renderShelfBookCards(shelf.books)}</section>${drawerMarkup}`;
   const drawer = content.querySelector("#shelfBookDrawer");
-  content.querySelector("[data-open-shelf-book]")?.addEventListener("click", () => drawer?.showModal());
-  content.querySelectorAll("[data-close-shelf-book]").forEach((button) => button.addEventListener("click", () => drawer?.close()));
+  bindDrawerControls(drawer, "[data-open-shelf-book]", "[data-close-shelf-book]");
   content.querySelector("#addShelfBookButton")?.addEventListener("click", addShelfBook);
-  content.querySelector("#shelfBookSearch")?.addEventListener("input", (event) => {
-    const query = event.target.value.trim().toLowerCase();
-    content.querySelectorAll("[data-search-row]").forEach((row) => { row.hidden = query && !row.dataset.searchRow.includes(query); });
-  });
+  bindSearchRows("#shelfBookSearch");
   content.querySelectorAll("[data-shelf-toggle]").forEach((button) => button.addEventListener("click", toggleShelfBook));
   content.querySelectorAll("[data-shelf-delete]").forEach((button) => button.addEventListener("click", deleteShelfBook));
   bindInlineNameEditing();
@@ -741,21 +742,22 @@ function renderRunDetails(run) {
   return `<div class="table-wrap"><table><thead><tr><th>工作簿</th><th>渠道</th><th>指标</th><th>源值</th><th>目标值</th><th>结果</th><th>说明</th></tr></thead><tbody>${(run.results || []).flatMap((result) => result.rows?.length ? result.rows.map((row) => `<tr data-run-detail="${escapeHtml(run.id)}"><td>${escapeHtml(result.sourceName)}</td><td>${renderChannel(row)}</td><td>${escapeHtml(row.metric)}</td><td>${formatNumber(row.sourceValue)}</td><td>${formatNumber(row.targetValue)}</td><td>${badge(row.status)}</td><td>${escapeHtml(row.message || row.range || "—")}</td></tr>`) : [`<tr data-run-detail="${escapeHtml(run.id)}"><td>${escapeHtml(result.sourceName)}</td><td colspan="5">${badge("error")}</td><td>${escapeHtml(result.error || "未知错误")}</td></tr>`]).join("")}</tbody></table></div>`;
 }
 
+const pageDefinitions = {
+  overview: { title: "今日运行", render: renderOverview },
+  sources: { title: "工作簿配置", render: renderSources },
+  runs: { title: "运行日志", render: () => renderRuns("scenario-1") },
+  channels: { title: "渠道消耗", render: renderChannelSpendPanel },
+  shooters: { title: "投手消耗", render: renderShooterPanel },
+  "scenario2-overview": { title: "今日运行", render: renderScenario2Overview },
+  "scenario2-config": { title: "工作簿配置", render: renderScenario2Config },
+  "scenario2-runs": { title: "运行日志", render: () => renderRuns("scenario-2") },
+  "scenario3-overview": { title: "今日运行", render: renderScenario3Overview },
+  "scenario3-config": { title: "工作簿配置", render: renderScenario3Config },
+  "scenario3-runs": { title: "运行日志", render: () => renderRuns("scenario-3") }
+};
+
 function render() {
-  const pages = {
-    overview: { title: "今日运行", render: renderOverview },
-    sources: { title: "工作簿配置", render: renderSources },
-    runs: { title: "运行日志", render: () => renderRuns("scenario-1") },
-    channels: { title: "渠道消耗", render: renderChannelSpendPanel },
-    shooters: { title: "投手消耗", render: renderShooterPanel },
-    "scenario2-overview": { title: "今日运行", render: renderScenario2Overview },
-    "scenario2-config": { title: "工作簿配置", render: renderScenario2Config },
-    "scenario2-runs": { title: "运行日志", render: () => renderRuns("scenario-2") },
-    "scenario3-overview": { title: "今日运行", render: renderScenario3Overview },
-    "scenario3-config": { title: "工作簿配置", render: renderScenario3Config },
-    "scenario3-runs": { title: "运行日志", render: () => renderRuns("scenario-3") }
-  };
-  const page = pages[state.page] || pages.overview;
+  const page = pageDefinitions[state.page] || pageDefinitions.overview;
   const secondary = state.page.startsWith("scenario2");
   const shelf = state.page.startsWith("scenario3");
   const shooterPage = state.page === "shooters";
@@ -771,7 +773,7 @@ function render() {
         ? (state.page === "scenario3-overview" ? "架上包 / 投手消耗搬运" : "架上包 / 工作簿配置")
         : "单表 / 渠道日报归集";
   document.querySelector(".content-subtitle").textContent = standalonePage
-    ? shooterPage ? "按所选日期查看投手消耗。" : "查看截至所选日期最近 5 天的渠道消耗。"
+    ? shooterPage ? "按所选日期查看投手消耗。" : "查看截至所选日期最近 10 天的渠道消耗。"
     : state.page === "scenario2-overview"
       ? "查看多表匹配每日处理状态，确认空值跳过与冲突数据。"
       : secondary
@@ -830,8 +832,10 @@ async function importSources() {
     const data = await api(scenarioApi("scenario-1", "/sources/import"), { method: "POST", body: JSON.stringify({ text, name }) });
     state.scenarios["scenario-1"].sources = data.sources;
     const added = data.results.filter((item) => item.status === "added").length;
+    const updated = data.results.filter((item) => item.status === "updated").length;
     const invalid = data.results.filter((item) => item.status === "invalid").length;
-    notify(`成功导入 ${added} 个，重复或无效 ${data.results.length - added} 个${invalid ? `（无效 ${invalid} 个）` : ""}`);
+    const unchanged = data.results.length - added - updated;
+    notify(`成功导入 ${added} 个${updated ? `，更新名称 ${updated} 个` : ""}，重复或无效 ${unchanged} 个${invalid ? `（无效 ${invalid} 个）` : ""}`);
     render();
   } catch (error) { notify(error.message, "error"); }
   finally { setLoading(button, false); }
@@ -966,8 +970,8 @@ safetyRulesClose?.addEventListener("click", () => safetyRulesDialog?.close());
 safetyRulesDialog?.addEventListener("click", (event) => { if (event.target === safetyRulesDialog) safetyRulesDialog.close(); });
 document.querySelectorAll("[data-scenario-toggle]").forEach((button) => button.addEventListener("click", toggleScenarioAccordion));
 setScenarioAccordion("scenario-1", readScenarioAccordion("scenario-1", true));
-  setScenarioAccordion("scenario-2", readScenarioAccordion("scenario-2", false));
-  setScenarioAccordion("scenario-3", readScenarioAccordion("scenario-3", false));
+setScenarioAccordion("scenario-2", readScenarioAccordion("scenario-2", false));
+setScenarioAccordion("scenario-3", readScenarioAccordion("scenario-3", false));
 sidebarScroll.addEventListener("click", (event) => {
   const button = event.target.closest(".menu-item[data-page]");
   if (button && sidebarScroll.contains(button)) navigateToPage(button);

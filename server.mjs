@@ -187,6 +187,21 @@ const entityDefinitions = {
   book: { scenario: "scenario-3", collection: "books", itemKey: "book", allowed: ["name", "enabled"], notFound: "未找到该架上包工作簿" }
 };
 
+const entityRoutes = [
+  { pattern: /^\/api\/scenarios\/scenario-1\/sources\/([^/]+)$/, definition: entityDefinitions.source },
+  { pattern: /^\/api\/sources\/([^/]+)$/, definition: entityDefinitions.source },
+  { pattern: /^\/api\/scenarios\/scenario-2\/pairs\/([^/]+)$/, definition: entityDefinitions.pair },
+  { pattern: /^\/api\/scenarios\/scenario-3\/books\/([^/]+)$/, definition: entityDefinitions.book }
+];
+
+function matchEntityRoute(pathname) {
+  for (const route of entityRoutes) {
+    const match = pathname.match(route.pattern);
+    if (match) return { definition: route.definition, id: match[1] };
+  }
+  return null;
+}
+
 async function patchEntity(request, response, definition, id, store) {
   const changes = await readJson(request);
   return sendStateMutation(response, (state) => {
@@ -282,15 +297,19 @@ async function importSources(request, response, store) {
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   if (!lines.length) return sendJson(response, 400, { error: "请至少输入一个 Google 表格链接" });
   const customName = String(name || "").trim();
+  const requestedName = customName && lines.length === 1 ? customName : "";
   const payload = await store.mutate((state) => {
     const scope = scenarioState(state);
     const results = [];
     for (const line of lines) {
       try {
         const parsed = parseSheetLink(line);
-        if (customName && lines.length === 1) parsed.name = customName;
+        if (requestedName) parsed.name = requestedName;
         const existing = scope.sources.find((item) => item.spreadsheetId === parsed.spreadsheetId);
-        if (existing) results.push({ status: "duplicate", name: existing.name, url: existing.url });
+        if (existing && requestedName && existing.name !== requestedName) {
+          existing.name = requestedName;
+          results.push({ status: "updated", name: existing.name, url: existing.url });
+        } else if (existing) results.push({ status: "duplicate", name: existing.name, url: existing.url });
         else {
           const source = newSource(parsed);
           scope.sources.push(source);
@@ -363,50 +382,21 @@ async function handleApi(request, response, pathname, store) {
     }
   }
 
-  const pairMatch = pathname.match(/^\/api\/scenarios\/scenario-2\/pairs\/([^/]+)$/);
-  if (pairMatch && request.method === "PATCH") {
-    return patchEntity(request, response, entityDefinitions.pair, pairMatch[1], store);
+  const entityRoute = matchEntityRoute(pathname);
+  if (entityRoute && request.method === "PATCH") {
+    return patchEntity(request, response, entityRoute.definition, entityRoute.id, store);
+  }
+  if (entityRoute && request.method === "DELETE") {
+    return deleteEntity(response, entityRoute.definition, entityRoute.id, store);
   }
 
-  if (pairMatch && request.method === "DELETE") {
-    return deleteEntity(response, entityDefinitions.pair, pairMatch[1], store);
-  }
-
-  const shelfBookMatch = pathname.match(/^\/api\/scenarios\/scenario-3\/books\/([^/]+)$/);
-  if (shelfBookMatch && request.method === "PATCH") {
-    return patchEntity(request, response, entityDefinitions.book, shelfBookMatch[1], store);
-  }
-
-  if (shelfBookMatch && request.method === "DELETE") {
-    return deleteEntity(response, entityDefinitions.book, shelfBookMatch[1], store);
-  }
-
-  const scopedSourceMatch = pathname.match(/^\/api\/scenarios\/(scenario-1)\/sources\/([^/]+)$/);
-  const legacySourceMatch = pathname.match(/^\/api\/sources\/([^/]+)$/);
-  const sourceId = scopedSourceMatch?.[2] || legacySourceMatch?.[1];
-  if (sourceId && request.method === "PATCH") {
-    return patchEntity(request, response, entityDefinitions.source, sourceId, store);
-  }
-
-  if (sourceId && request.method === "DELETE") {
-    return deleteEntity(response, entityDefinitions.source, sourceId, store);
-  }
-
-  const scopedJobMatch = pathname.match(/^\/api\/scenarios\/(scenario-1)\/jobs\/(preview|run)$/);
+  const scopedJobMatch = pathname.match(/^\/api\/scenarios\/(scenario-[123])\/jobs\/(preview|run)$/);
   const legacyJobMatch = pathname.match(/^\/api\/jobs\/(preview|run)$/);
-  const jobType = scopedJobMatch?.[2] || legacyJobMatch?.[1];
-  if (request.method === "POST" && jobType && (scopedJobMatch || legacyJobMatch)) {
-    return runScenarioJob(request, response, "scenario-1", jobType, store);
+  if (request.method === "POST" && scopedJobMatch) {
+    return runScenarioJob(request, response, scopedJobMatch[1], scopedJobMatch[2], store);
   }
-
-  const scenario2JobMatch = pathname.match(/^\/api\/scenarios\/scenario-2\/jobs\/(preview|run)$/);
-  if (scenario2JobMatch && request.method === "POST") {
-    return runScenarioJob(request, response, "scenario-2", scenario2JobMatch[1], store);
-  }
-
-  const shelfJobMatch = pathname.match(/^\/api\/scenarios\/scenario-3\/jobs\/(preview|run)$/);
-  if (shelfJobMatch && request.method === "POST") {
-    return runScenarioJob(request, response, "scenario-3", shelfJobMatch[1], store);
+  if (request.method === "POST" && legacyJobMatch) {
+    return runScenarioJob(request, response, "scenario-1", legacyJobMatch[1], store);
   }
 
   return sendJson(response, 404, { error: "接口不存在" });
@@ -456,7 +446,12 @@ async function serveStatic(response, pathname) {
   if (!path) return sendJson(response, 403, { error: "禁止访问" });
   try {
     const content = await readFile(path);
-    response.writeHead(200, { "content-type": mimeTypes[extname(path)] || "application/octet-stream" });
+    const extension = extname(path);
+    const cacheControl = extension === ".html" ? "no-cache, must-revalidate" : "public, max-age=31536000, immutable";
+    response.writeHead(200, {
+      "content-type": mimeTypes[extension] || "application/octet-stream",
+      "cache-control": cacheControl
+    });
     response.end(content);
   } catch {
     sendJson(response, 404, { error: "页面不存在" });

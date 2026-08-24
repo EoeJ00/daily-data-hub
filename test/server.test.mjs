@@ -69,11 +69,22 @@ test("serves the app and preserves concurrent cross-scenario API mutations", asy
 
   assert.equal(page.status, 200);
   assert.match(await page.text(), /MIULX/);
+  assert.equal(page.headers.get("cache-control"), "no-cache, must-revalidate");
   assert.equal((await fetch(`${baseUrl}/api/jobs/preview`)).status, 404);
   assert.equal(sourceResponse.status, 200);
   assert.equal(pairResponse.status, 200);
   assert.equal(bookResponse.status, 200);
   const source = await sourceResponse.json();
+  assert.equal(source.results[0].name, "自定义单表");
+  const duplicateSourceResponse = await request("/api/scenarios/scenario-1/sources/import", {
+    name: "重复导入改名",
+    text: source.results[0].url
+  });
+  assert.equal(duplicateSourceResponse.status, 200);
+  const duplicateSource = await duplicateSourceResponse.json();
+  assert.equal(duplicateSource.results[0].status, "updated");
+  assert.equal(duplicateSource.results[0].name, "重复导入改名");
+  assert.equal(duplicateSource.sources[0].name, "重复导入改名");
   const pair = await pairResponse.json();
   const book = await bookResponse.json();
   const rename = (path, body) => fetch(`${baseUrl}${path}`, {

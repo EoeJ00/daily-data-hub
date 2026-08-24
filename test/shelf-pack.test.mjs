@@ -113,3 +113,26 @@ test("aggregates one shooter across multiple rack packages and maps both metrics
   assert.ok(executed.rows.every((row) => row.status === "written"));
   assert.deepEqual(writes.map((item) => item.range).sort(), ["'C'!D5", "'C'!E5", "'总表'!C2", "'总表'!D2"]);
 });
+
+test("uses the column immediately right of a shooter code for generic return headers", async () => {
+  const values = new Map([
+    ["book:架上包 A", [["日期", "投手/包名", "服务费", "消耗", "回流消耗"], [46247, "C", 0, 10, 1]]],
+    ["book:C", [["备注", "日期", "渠道名", "服务费", "其他", "消耗", "回流"], [null, 46247, "A", 0, null, null, null]]],
+    ["book:总表", [["备注", "日期", "总消耗（USD）", "其他", "C", "回流"], [null, 46247, null, null, null, null]]]
+  ]);
+  const deps = {
+    getWorkbook: async () => ({ properties: { title: "架上包数据表" }, sheets: [
+      { properties: { title: "架上包 A", hidden: false } },
+      { properties: { title: "C", hidden: false } },
+      { properties: { title: "总表", hidden: false } }
+    ] }),
+    getSheetValues: async (id, sheet) => values.get(`${id}:${sheet}`) || []
+  };
+  const result = await collectShelfBook({ id: "book-id", name: "架上包数据表", spreadsheetId: "book" }, "2026-08-13", deps);
+  const spendRow = result.rows.find((row) => row.metric === "消耗");
+  const returnRow = result.rows.find((row) => row.metric === "回流消耗");
+  assert.equal(spendRow.detail.range, "'C'!F2");
+  assert.equal(spendRow.total.range, "'总表'!E2");
+  assert.equal(returnRow.detail.range, "'C'!G2");
+  assert.equal(returnRow.total.range, "'总表'!F2");
+});
