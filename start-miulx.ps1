@@ -59,16 +59,46 @@ function Stop-ExistingDailyService {
     throw "The existing Daily Data Hub responded on port 4173, but its owning process could not be found. Close the old node.exe manually and try again."
   }
 
-  foreach ($ownerPid in $ownerPids) {
-    $process = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+  foreach ($servicePid in $ownerPids) {
+    $process = Get-Process -Id $servicePid -ErrorAction SilentlyContinue
     if (-not $process) {
       throw "The process owning port 4173 could not be inspected. Close the old node.exe manually and try again."
     }
     if ($process.ProcessName -notin @("node", "nodejs")) {
       throw "Port 4173 is used by $($process.ProcessName), not node.exe. The launcher did not stop it."
     }
-    Stop-Process -Id $ownerPid -Force
-    Write-LauncherLog "Stopped old Daily Data Hub node.exe (PID $ownerPid)."
+  }
+
+  $graceful = $false
+  try {
+    $shutdown = Invoke-RestMethod -Uri "$serverUrl/api/system/shutdown" -Method Post -ContentType "application/json" -Body "{}" -TimeoutSec 5
+    $graceful = $shutdown.status -eq "draining"
+    if ($graceful) {
+      Write-LauncherLog "Graceful restart requested; waiting for the task queue to drain."
+      $deadline = (Get-Date).AddMinutes(5)
+      do {
+        Start-Sleep -Milliseconds 500
+        $remaining = @(Get-NetTCPConnection -LocalPort 4173 -State Listen -ErrorAction SilentlyContinue)
+      } while ($remaining -and (Get-Date) -lt $deadline)
+      if (-not $remaining) {
+        Write-LauncherLog "The previous Daily Data Hub stopped gracefully."
+        return
+      }
+      Write-LauncherLog "Graceful shutdown exceeded five minutes; falling back to a verified force stop."
+    }
+  } catch {
+    Write-LauncherLog "Graceful shutdown was unavailable: $($_.Exception.Message)"
+  }
+
+  $remainingListeners = @(Get-NetTCPConnection -LocalPort 4173 -State Listen -ErrorAction SilentlyContinue)
+  $remainingPids = @($remainingListeners | Select-Object -ExpandProperty OwningProcess -Unique)
+  foreach ($servicePid in $remainingPids) {
+    $process = Get-Process -Id $servicePid -ErrorAction SilentlyContinue
+    if (-not $process -or $process.ProcessName -notin @("node", "nodejs")) {
+      throw "Port 4173 changed ownership during restart; the launcher did not force stop it."
+    }
+    Stop-Process -Id $servicePid -Force
+    Write-LauncherLog "Force-stopped old Daily Data Hub node.exe after graceful shutdown fallback (PID $servicePid)."
   }
   Start-Sleep -Milliseconds 250
 }

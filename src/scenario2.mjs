@@ -433,10 +433,7 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
   const { totalSheet, details } = detailDescriptors(ownWorkbook, pair.targetSheet || "总表");
   if (!totalSheet) throw new Error(`自己的日报表未找到目标页签：${pair.targetSheet || "总表"}`);
   const targetDescriptors = details;
-  const [totalValues, totalDisplayValues] = await Promise.all([
-    readSheetMap(pair.own.spreadsheetId, [totalSheet.title], deps),
-    readSheetMap(pair.own.spreadsheetId, [totalSheet.title], deps, { valueRenderOption: "FORMATTED_VALUE" })
-  ]).then(([values, displayValues]) => [values.get(totalSheet.title) || [], displayValues.get(totalSheet.title) || []]);
+  const totalValues = (await readSheetMap(pair.own.spreadsheetId, [totalSheet.title], deps, { valueRenderOption: "FORMATTED_VALUE" })).get(totalSheet.title) || [];
   const totalTarget = locateTotal(totalValues, businessDate);
   const matchCache = new Map();
   const getMatch = (row) => {
@@ -501,7 +498,7 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
       const totalKey = `${match.descriptor.route.fullChain || match.descriptor.route.code}\u0000${row.metric}`;
       let totalColumn = totalColumnCache.get(totalKey);
       if (totalColumn === undefined) {
-        totalColumn = locateTotalColumn(totalDisplayValues, totalTarget, match.descriptor.route, row.metric);
+        totalColumn = locateTotalColumn(totalValues, totalTarget, match.descriptor.route, row.metric);
         totalColumnCache.set(totalKey, totalColumn);
       }
       total = totalColumn === -2
@@ -532,6 +529,23 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
 }
 
 const defaultDeps = { getWorkbook, getSheetValues, getSheetValuesBatch, batchWrite };
+
+function withWorkbookCache(deps) {
+  const cache = new Map();
+  return {
+    ...deps,
+    getWorkbook(spreadsheetId) {
+      if (!cache.has(spreadsheetId)) {
+        const request = Promise.resolve(deps.getWorkbook(spreadsheetId)).catch((error) => {
+          cache.delete(spreadsheetId);
+          throw error;
+        });
+        cache.set(spreadsheetId, request);
+      }
+      return cache.get(spreadsheetId);
+    }
+  };
+}
 
 export async function collectScenario2Pair(pair, businessDate, deps = defaultDeps) {
   const [clientWorkbook, ownWorkbook] = await Promise.all([
@@ -574,19 +588,20 @@ export async function collectScenario2Pair(pair, businessDate, deps = defaultDep
 }
 
 export async function executeScenario2Pair(pair, businessDate, deps = defaultDeps) {
-  const preview = await collectScenario2Pair(pair, businessDate, deps);
+  const runDeps = withWorkbookCache(deps);
+  const preview = await collectScenario2Pair(pair, businessDate, runDeps);
   const detailUpdates = preview.rows
     .filter((row) => row.status === "ready" && row.detail?.status === "ready" && row.total?.status !== "conflict" && row.total?.status !== "error")
     .map((row) => ({ range: row.detail.range, value: row.sourceValue }));
-  await deps.batchWrite(pair.own.spreadsheetId, detailUpdates);
+  await runDeps.batchWrite(pair.own.spreadsheetId, detailUpdates);
 
-  const afterDetail = await collectScenario2Pair(pair, businessDate, deps);
+  const afterDetail = await collectScenario2Pair(pair, businessDate, runDeps);
   const totalUpdates = afterDetail.rows
     .filter((row) => row.detail?.status === "same" && row.total?.status === "ready")
     .map((row) => ({ range: row.total.range, value: row.sourceValue }));
-  await deps.batchWrite(pair.own.spreadsheetId, totalUpdates);
+  await runDeps.batchWrite(pair.own.spreadsheetId, totalUpdates);
 
-  const confirmed = await collectScenario2Pair(pair, businessDate, deps);
+  const confirmed = await collectScenario2Pair(pair, businessDate, runDeps);
   const writtenRanges = new Set([...detailUpdates, ...totalUpdates].map((item) => item.range));
   return {
     ...confirmed,

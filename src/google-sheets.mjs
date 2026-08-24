@@ -5,11 +5,9 @@ import { quoteSheetTitle } from "./spreadsheet-utils.mjs";
 let tokenCache;
 let tokenRequest;
 
-// A 429 from Sheets is usually the per-user read quota. Retrying immediately
-// only consumes more quota and obscures the actionable error, so surface it
-// to the caller. Transient server/network failures remain retryable.
-const RETRYABLE_STATUS = new Set([408, 500, 502, 503, 504]);
+const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const READ_ATTEMPTS = 4;
+const DEFAULT_READ_INTERVAL_MS = 1_200;
 
 function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -19,10 +17,33 @@ function retryDelay(attempt, response) {
   const retryAfterHeader = response?.headers?.get?.("retry-after");
   const retryAfter = Number(retryAfterHeader);
   if (retryAfterHeader && Number.isFinite(retryAfter) && retryAfter >= 0) {
-    return Math.min(retryAfter * 1000, 3_000);
+    return Math.min(retryAfter * 1000, response?.status === 429 ? 60_000 : 3_000);
   }
+  if (response?.status === 429) return [5_000, 20_000, 60_000][attempt - 1] || 60_000;
   return [300, 800, 1_600][attempt - 1] || 1_600;
 }
+
+export function createRequestScheduler({ interval = DEFAULT_READ_INTERVAL_MS, now = () => Date.now(), delay = wait } = {}) {
+  let nextStart = 0;
+  let tail = Promise.resolve();
+  return (task) => {
+    const run = tail.then(async () => {
+      const remaining = Math.max(0, nextStart - now());
+      if (remaining) await delay(remaining);
+      nextStart = Math.max(nextStart, now()) + interval;
+      return task();
+    });
+    tail = run.catch(() => {});
+    return run;
+  };
+}
+
+function configuredReadInterval() {
+  const value = Number(process.env.GOOGLE_SHEETS_READ_INTERVAL_MS);
+  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_READ_INTERVAL_MS;
+}
+
+const scheduleReadRequest = createRequestScheduler({ interval: configuredReadInterval() });
 
 function networkError(label, url, error, retries = 0) {
   const cause = error?.cause;
@@ -119,11 +140,18 @@ async function accessToken() {
 async function googleRequest(path, options = {}) {
   const url = `https://sheets.googleapis.com/v4/${path}`;
   const method = String(options.method || "GET").toUpperCase();
-  const { response, data } = await fetchJson(url, {
+  const requestOptions = {
     ...options,
     headers: { authorization: `Bearer ${await accessToken()}`, "content-type": "application/json", ...options.headers }
-  }, "Google Sheets 接口", { attempts: method === "GET" ? READ_ATTEMPTS : 1 });
-  if (!response.ok) throw new Error(data.error?.message || `Google Sheets 请求失败：${response.status}`);
+  };
+  const request = () => fetchJson(url, requestOptions, "Google Sheets 接口", { attempts: method === "GET" ? READ_ATTEMPTS : 1 });
+  const { response, data } = method === "GET" ? await scheduleReadRequest(request) : await request();
+  if (!response.ok) {
+    const quotaMessage = response.status === 429
+      ? `Google Sheets 读取配额暂时耗尽，系统已自动限速并退避重试，请稍后再次执行${data.error?.message ? `（${data.error.message}）` : ""}`
+      : "";
+    throw new Error(quotaMessage || data.error?.message || `Google Sheets 请求失败：${response.status}`);
+  }
   return data;
 }
 

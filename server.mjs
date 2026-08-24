@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collectWorkbook, executeWorkbook } from "./src/collector.mjs";
@@ -7,6 +8,7 @@ import { collectScenario2Pair, executeScenario2Pair } from "./src/scenario2.mjs"
 import { collectShelfBook, executeShelfBook } from "./src/shelf-pack.mjs";
 import { getConnectionStatus } from "./src/google-sheets.mjs";
 import { JsonStateStore } from "./src/state-store.mjs";
+import { JobQueue } from "./src/job-queue.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = join(root, "public");
@@ -14,7 +16,6 @@ const dataDir = join(root, "data");
 const stateFile = join(dataDir, "state.json");
 const port = Number(process.env.PORT || 4173);
 const host = process.env.HOST || "127.0.0.1";
-const activeJobKeys = new Set();
 
 const defaultShelfBook = {
   id: "shelf-pack-default",
@@ -73,17 +74,9 @@ export function normalizeState(raw) {
 }
 
 function sendJson(response, status, body) {
+  if (response.destroyed || response.writableEnded) return;
   response.writeHead(status, jsonHeaders);
   response.end(JSON.stringify(body));
-}
-
-function acquireJobLock(response, key) {
-  if (activeJobKeys.has(key)) return false;
-  activeJobKeys.add(key);
-  const release = () => activeJobKeys.delete(key);
-  response.once("finish", release);
-  response.once("close", release);
-  return true;
 }
 
 async function readJson(request) {
@@ -231,7 +224,6 @@ const jobDefinitions = {
     collection: "sources",
     idsKey: "sourceIds",
     emptyMessage: "没有已启用的工作簿",
-    lockedMessage: "单表已有任务正在执行，请稍后再试",
     collect: collectWorkbook,
     execute: executeWorkbook,
     failed: (source, error) => ({ sourceId: source.id, sourceName: source.name, status: "failed", error: error.message, rows: [] })
@@ -240,7 +232,6 @@ const jobDefinitions = {
     collection: "pairs",
     idsKey: "pairIds",
     emptyMessage: "没有已启用的日报配对",
-    lockedMessage: "多表匹配已有任务正在执行，请稍后再试",
     collect: collectScenario2Pair,
     execute: executeScenario2Pair,
     failed: (pair, error) => ({ pairId: pair.id, pairName: pair.name, sourceName: pair.client.name, targetName: pair.own.name, status: "failed", error: error.message, rows: [] })
@@ -249,24 +240,13 @@ const jobDefinitions = {
     collection: "books",
     idsKey: "bookIds",
     emptyMessage: "没有已启用的架上包工作簿",
-    lockedMessage: "架上包已有任务正在执行，请稍后再试",
     collect: collectShelfBook,
     execute: executeShelfBook,
     failed: (book, error) => ({ sourceId: book.id, sourceName: book.name, status: "failed", error: error.message, rows: [] })
   }
 };
 
-async function runScenarioJob(request, response, scenario, type, store) {
-  const definition = jobDefinitions[scenario];
-  if (!acquireJobLock(response, scenario)) return sendJson(response, 409, { error: definition.lockedMessage });
-  const body = await readJson(request);
-  const businessDate = body.date || new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
-  const ids = Array.isArray(body[definition.idsKey]) ? body[definition.idsKey] : [];
-  const snapshot = await store.read();
-  const selected = scenarioState(snapshot, scenario)[definition.collection]
-    .filter((item) => item.enabled && (!ids.length || ids.includes(item.id)));
-  if (!selected.length) return sendJson(response, 400, { error: definition.emptyMessage });
-
+async function executeScenarioJob({ scenario, type, businessDate, selected, definition, store }) {
   const execute = type === "run";
   const results = [];
   for (const item of selected) {
@@ -289,7 +269,29 @@ async function runScenarioJob(request, response, scenario, type, store) {
     const scope = scenarioState(state, scenario);
     scope.runs = [run, ...scope.runs].slice(0, 50);
   });
-  return sendJson(response, 200, run);
+  return run;
+}
+
+async function runScenarioJob(request, response, scenario, type, store, queue, definitions) {
+  const definition = definitions[scenario];
+  const body = await readJson(request);
+  const businessDate = body.date || new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+  const ids = Array.isArray(body[definition.idsKey]) ? body[definition.idsKey] : [];
+  const snapshot = await store.read();
+  const selected = scenarioState(snapshot, scenario)[definition.collection]
+    .filter((item) => item.enabled && (!ids.length || ids.includes(item.id)));
+  if (!selected.length) return sendJson(response, 400, { error: definition.emptyMessage });
+  try {
+    const queued = queue.enqueue(
+      () => executeScenarioJob({ scenario, type, businessDate, selected, definition, store }),
+      { scenario, type, businessDate }
+    );
+    response.setHeader("x-job-id", queued.id);
+    response.setHeader("x-job-position", String(queued.position));
+    return sendJson(response, 200, await queued.promise);
+  } catch (error) {
+    return sendJson(response, error.status || 500, { error: error.message });
+  }
 }
 
 async function importSources(request, response, store) {
@@ -324,7 +326,17 @@ async function importSources(request, response, store) {
   return sendJson(response, 200, payload);
 }
 
-async function handleApi(request, response, pathname, store) {
+async function handleApi(request, response, pathname, store, runtime) {
+  if (request.method === "GET" && pathname === "/api/system/status") {
+    return sendJson(response, 200, { shuttingDown: runtime.isShuttingDown(), queue: runtime.queue.snapshot() });
+  }
+  if (request.method === "POST" && pathname === "/api/system/shutdown") {
+    if (!runtime.onShutdown) return sendJson(response, 503, { error: "当前运行模式不支持远程优雅关闭" });
+    sendJson(response, 202, { status: "draining", queue: runtime.queue.snapshot() });
+    void runtime.onShutdown("api");
+    return;
+  }
+  if (runtime.isShuttingDown()) return sendJson(response, 503, { error: "服务正在优雅重启，请稍后重试" });
   if (request.method === "GET" && pathname === "/api/bootstrap") {
     const state = await store.read();
     const primary = scenarioState(state);
@@ -393,10 +405,10 @@ async function handleApi(request, response, pathname, store) {
   const scopedJobMatch = pathname.match(/^\/api\/scenarios\/(scenario-[123])\/jobs\/(preview|run)$/);
   const legacyJobMatch = pathname.match(/^\/api\/jobs\/(preview|run)$/);
   if (request.method === "POST" && scopedJobMatch) {
-    return runScenarioJob(request, response, scopedJobMatch[1], scopedJobMatch[2], store);
+    return runScenarioJob(request, response, scopedJobMatch[1], scopedJobMatch[2], store, runtime.queue, runtime.jobs);
   }
   if (request.method === "POST" && legacyJobMatch) {
-    return runScenarioJob(request, response, "scenario-1", legacyJobMatch[1], store);
+    return runScenarioJob(request, response, "scenario-1", legacyJobMatch[1], store, runtime.queue, runtime.jobs);
   }
 
   return sendJson(response, 404, { error: "接口不存在" });
@@ -441,16 +453,22 @@ export function validateApiRequest(request) {
   return null;
 }
 
-async function serveStatic(response, pathname) {
+async function serveStatic(request, response, pathname) {
   const path = resolvePublicPath(pathname);
   if (!path) return sendJson(response, 403, { error: "禁止访问" });
   try {
     const content = await readFile(path);
     const extension = extname(path);
-    const cacheControl = extension === ".html" ? "no-cache, must-revalidate" : "public, max-age=31536000, immutable";
+    const etag = `"${createHash("sha256").update(content).digest("base64url").slice(0, 20)}"`;
+    const cacheControl = [".html", ".js", ".css"].includes(extension) ? "no-cache, must-revalidate" : "public, max-age=86400";
+    if (request.headers["if-none-match"] === etag) {
+      response.writeHead(304, { "cache-control": cacheControl, etag });
+      return response.end();
+    }
     response.writeHead(200, {
       "content-type": mimeTypes[extension] || "application/octet-stream",
-      "cache-control": cacheControl
+      "cache-control": cacheControl,
+      etag
     });
     response.end(content);
   } catch {
@@ -458,16 +476,17 @@ async function serveStatic(response, pathname) {
   }
 }
 
-export function createDailyDataServer({ store = stateStore } = {}) {
+export function createDailyDataServer({ store = stateStore, queue = new JobQueue(), jobs = jobDefinitions, onShutdown = null, isShuttingDown = () => false } = {}) {
+  const runtime = { queue, jobs, onShutdown, isShuttingDown };
   return createServer(async (request, response) => {
     try {
       const { pathname } = new URL(request.url, `http://${request.headers.host}`);
       if (pathname.startsWith("/api/")) {
         const rejection = validateApiRequest(request);
         if (rejection) return sendJson(response, rejection.status, { error: rejection.error });
-        await handleApi(request, response, pathname, store);
+        await handleApi(request, response, pathname, store, runtime);
       } else {
-        await serveStatic(response, pathname);
+        await serveStatic(request, response, pathname);
       }
     } catch (error) {
       sendJson(response, 500, { error: error.message || "服务器错误" });
@@ -477,7 +496,35 @@ export function createDailyDataServer({ store = stateStore } = {}) {
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  createDailyDataServer().listen(port, host, () => {
+  const queue = new JobQueue();
+  let shuttingDown = false;
+  let shutdownPromise;
+  let server;
+  const gracefulShutdown = (reason) => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      shuttingDown = true;
+      queue.close();
+      console.log(`Daily Data Hub 正在优雅关闭（${reason}），等待任务队列完成...`);
+      const closed = new Promise((resolveClose) => server.close(resolveClose));
+      server.closeIdleConnections?.();
+      const timeout = setTimeout(() => {
+        console.error("优雅关闭等待超时，强制结束剩余连接");
+        server.closeAllConnections?.();
+        process.exit(1);
+      }, 300_000);
+      await queue.onIdle();
+      server.closeIdleConnections?.();
+      await closed;
+      clearTimeout(timeout);
+      console.log("Daily Data Hub 已安全停止");
+    })();
+    return shutdownPromise;
+  };
+  server = createDailyDataServer({ queue, onShutdown: gracefulShutdown, isShuttingDown: () => shuttingDown });
+  process.once("SIGINT", () => { void gracefulShutdown("SIGINT"); });
+  process.once("SIGTERM", () => { void gracefulShutdown("SIGTERM"); });
+  server.listen(port, host, () => {
     console.log(`Daily Data Hub 已启动：http://localhost:${port}`);
   });
 }

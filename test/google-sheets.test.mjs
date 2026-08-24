@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fetchJson } from "../src/google-sheets.mjs";
+import { createRequestScheduler, fetchJson } from "../src/google-sheets.mjs";
 
 function jsonResponse(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
@@ -69,16 +69,39 @@ test("fetchJson does not retry when only one attempt is allowed", async () => {
   assert.equal(calls, 1);
 });
 
-test("fetchJson surfaces a Sheets quota response without multiplying reads", async () => {
+test("fetchJson backs off before retrying a Sheets quota response", async () => {
   let calls = 0;
+  const delays = [];
   const result = await fetchJson("https://example.test", {}, "Google Sheets 接口", {
     attempts: 4,
     fetchImpl: async () => {
       calls += 1;
-      return jsonResponse({ error: { message: "Quota exceeded" } }, 429);
+      return calls < 4
+        ? jsonResponse({ error: { message: "Quota exceeded" } }, 429)
+        : jsonResponse({ ok: true });
     },
-    delay: async () => { throw new Error("quota response should not be retried"); }
+    delay: async (milliseconds) => delays.push(milliseconds)
   });
-  assert.equal(result.response.status, 429);
-  assert.equal(calls, 1);
+  assert.equal(result.response.status, 200);
+  assert.equal(calls, 4);
+  assert.deepEqual(delays, [5_000, 20_000, 60_000]);
+});
+
+test("request scheduler serializes reads at the configured interval", async () => {
+  let currentTime = 0;
+  const delays = [];
+  const starts = [];
+  const schedule = createRequestScheduler({
+    interval: 1_200,
+    now: () => currentTime,
+    delay: async (milliseconds) => {
+      delays.push(milliseconds);
+      currentTime += milliseconds;
+    }
+  });
+
+  await Promise.all(Array.from({ length: 3 }, () => schedule(async () => starts.push(currentTime))));
+
+  assert.deepEqual(starts, [0, 1_200, 2_400]);
+  assert.deepEqual(delays, [1_200, 1_200]);
 });

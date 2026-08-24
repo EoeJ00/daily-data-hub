@@ -188,13 +188,17 @@ test("matches semantic fields and compound channel suffixes without workbook-spe
     ["日期", "总消耗", "11-1", "回流", "11-4", "回流"],
     ["2026/8/13", "82.660", "40.100", "1.180", "40.970", "0.410"]
   ];
+  let totalReads = 0;
   const deps = {
     getWorkbook: async (id) => id === clientId
       ? { properties: { title: "甲方表" }, sheets: [{ properties: { sheetId: 1, title: "甲方明细" } }] }
       : { properties: { title: "自己的日报" }, sheets: ["总表", "RS9-CS-11-1(SUKI)", "RS9-CS-11-4(SUKI)"].map((title, index) => ({ properties: { sheetId: index + 1, title } })) },
-    getSheetValues: async (id, sheet, options = {}) => options.valueRenderOption === "FORMATTED_VALUE" && sheet === "总表"
-      ? displayTotal
-      : rawValues.get(`${id}:${sheet}`),
+    getSheetValues: async (id, sheet, options = {}) => {
+      if (sheet === "总表") totalReads += 1;
+      return options.valueRenderOption === "FORMATTED_VALUE" && sheet === "总表"
+        ? displayTotal
+        : rawValues.get(`${id}:${sheet}`);
+    },
     batchWrite: async () => ({ totalUpdatedCells: 0 })
   };
   const pair = { id: "compound", name: "复合渠道", client: { spreadsheetId: clientId, gid: "1" }, own: { spreadsheetId: ownId }, targetSheet: "总表" };
@@ -205,13 +209,22 @@ test("matches semantic fields and compound channel suffixes without workbook-spe
   assert.ok(preview.rows.every((row) => row.status === "same"));
   assert.deepEqual([...new Set(preview.rows.map((row) => row.routeKey))], ["RS9-CS-11-1", "RS9-CS-11-4"]);
   assert.equal(preview.rows.find((row) => row.channel.endsWith("11-4") && row.metric === "回流消耗").targetSheet, "RS9-CS-11-4(SUKI)");
+  assert.equal(totalReads, 1);
 });
 
 test("writes detail rows first, rechecks them, and then writes the total", async () => {
   const { pair, deps } = scenario2Fixture();
-  const result = await executeScenario2Pair(pair, "2026-08-13", deps);
+  let workbookReads = 0;
+  const result = await executeScenario2Pair(pair, "2026-08-13", {
+    ...deps,
+    getWorkbook: async (...args) => {
+      workbookReads += 1;
+      return deps.getWorkbook(...args);
+    }
+  });
   assert.ok(result.rows.every((row) => row.status === "written"));
   assert.ok(result.rows.every((row) => row.detail.status === "same" && row.total.status === "same"));
+  assert.equal(workbookReads, 2);
 });
 
 test("ignores hidden own and client chain sheets during matching", async () => {
