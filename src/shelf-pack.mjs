@@ -120,6 +120,40 @@ function locateDateRow(values, header, businessDate) {
   return values.findIndex((row, index) => index > header.row && dateKey(row?.[header.date], businessDate) === businessDate);
 }
 
+function planShooterDateRows(values, header, businessDate, sheetTitle) {
+  const existingRow = locateDateRow(values, header, businessDate);
+  if (existingRow >= 0) return { row: existingRow, updates: [] };
+
+  const datedRows = [];
+  for (let row = header.row + 1; row < values.length; row += 1) {
+    const date = dateKey(values[row]?.[header.date], businessDate);
+    if (date) datedRows.push({ row, date });
+  }
+
+  const last = datedRows.at(-1);
+  if (!last) {
+    const row = header.row + 1;
+    return { row, updates: [{ range: sheetRange(sheetTitle, row, header.date), value: businessDate }] };
+  }
+
+  const lastTime = Date.parse(`${last.date}T00:00:00Z`);
+  const targetTime = Date.parse(`${businessDate}T00:00:00Z`);
+  if (!Number.isFinite(lastTime) || !Number.isFinite(targetTime)) {
+    return { error: `无法解析投手消耗表日期：${last.date} → ${businessDate}` };
+  }
+  if (targetTime <= lastTime) {
+    return { error: `投手消耗表缺少 ${businessDate} 日期行，且该日期早于表内最后日期 ${last.date}，无法向下追加` };
+  }
+
+  const dayCount = Math.round((targetTime - lastTime) / 86_400_000);
+  const updates = Array.from({ length: dayCount }, (_, index) => {
+    const row = last.row + index + 1;
+    const value = new Date(lastTime + (index + 1) * 86_400_000).toISOString().slice(0, 10);
+    return { range: sheetRange(sheetTitle, row, header.date), value };
+  });
+  return { row: last.row + dayCount, updates };
+}
+
 function findTotalHeader(values) {
   for (let row = 0; row < Math.min(values.length, 24); row += 1) {
     const cells = values[row] || [];
@@ -218,17 +252,23 @@ function mapShelfTargets(records, businessDate, targetSheets, totalSheet) {
       }
       const target = match;
       const header = findHeader(target.values, "shooter");
-      const dateRow = header ? locateDateRow(target.values, header, businessDate) : -1;
+      const datePlan = header ? planShooterDateRows(target.values, header, businessDate, target.title) : null;
       let detail;
       if (!header) {
         detail = { status: "error", message: "投手消耗表未找到日期、消耗和回流表头" };
-      } else if (dateRow < 0) {
-        detail = { status: "error", message: `投手消耗表缺少 ${businessDate} 日期行` };
+      } else if (datePlan.error) {
+        detail = { status: "error", message: datePlan.error };
       } else {
+        const dateRow = datePlan.row;
         const column = metric === "消耗" ? header.spend : header.returnSpend;
         const range = sheetRange(target.title, dateRow, column);
         const inspection = inspectTarget(target.values[dateRow]?.[column], sourceValue, range);
-        detail = { ...inspection, range };
+        detail = {
+          ...inspection,
+          range,
+          dateUpdates: datePlan.updates,
+          message: datePlan.updates.length ? `将自动补充 ${datePlan.updates.length} 个日期行至 ${businessDate}` : inspection.message
+        };
       }
 
       let total;
@@ -355,12 +395,16 @@ async function verifyShelfWrites(book, preview, updates, deps) {
 
 export async function executeShelfBook(book, businessDate, deps = defaultDeps) {
   const preview = await collectShelfBook(book, businessDate, deps);
-  const updates = preview.rows.flatMap((row) => {
-    if (row.status !== "ready") return [];
+  const readyRows = preview.rows.filter((row) => row.status === "ready");
+  const dateUpdates = [...new Map(readyRows
+    .flatMap((row) => row.detail?.dateUpdates || [])
+    .map((update) => [update.range, update])).values()];
+  const valueUpdates = readyRows.flatMap((row) => {
     return [row.detail, row.total]
       .filter((target) => target?.status === "ready" && target.range)
       .map((target) => ({ range: target.range, value: row.sourceValue }));
   });
+  const updates = [...dateUpdates, ...valueUpdates];
   await deps.batchWrite(book.spreadsheetId, updates);
   return updates.length ? verifyShelfWrites(book, preview, updates, deps) : preview;
 }

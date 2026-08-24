@@ -114,6 +114,82 @@ test("aggregates one shooter across multiple rack packages and maps both metrics
   assert.deepEqual(writes.map((item) => item.range).sort(), ["'C'!D5", "'C'!E5", "'总表'!C2", "'总表'!D2"]);
 });
 
+test("appends missing shooter dates in sequence before writing metrics", async () => {
+  const values = new Map([
+    ["book:架上包 A", [["日期", "投手/包名", "服务费", "消耗", "回流消耗"], ["2026-08-15", "C", 0, 10, 1]]],
+    ["book:C", [["日期", "渠道名", "服务费", "消耗", "回流消耗"], ["2026-08-13", "A", 0, null, null], [], []]],
+    ["book:总表", [["日期", "总消耗", "C", "C回流"], ["2026-08-15", null, null, null]]]
+  ]);
+  const location = (range) => {
+    const [quotedTitle, cell] = range.split("!");
+    const title = quotedTitle.slice(1, -1).replaceAll("''", "'");
+    const match = cell?.match(/^([A-Z]+)(\d+)$/);
+    if (!match) return { title };
+    const column = [...match[1]].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
+    return { title, row: Number(match[2]) - 1, column };
+  };
+  const deps = {
+    getWorkbook: async () => ({ properties: { title: "架上包数据表" }, sheets: [
+      { properties: { title: "架上包 A", hidden: false } },
+      { properties: { title: "C", hidden: false } },
+      { properties: { title: "总表", hidden: false } }
+    ] }),
+    getSheetValues: async (id, sheet) => values.get(`${id}:${sheet}`) || [],
+    getSheetValuesBatch: async (id, ranges) => ranges.map((range) => {
+      const target = location(range);
+      const sheet = values.get(`${id}:${target.title}`) || [];
+      return target.row === undefined ? sheet : [[sheet[target.row]?.[target.column]]];
+    })
+  };
+
+  const preview = await collectShelfBook({ id: "book-id", name: "架上包数据表", spreadsheetId: "book" }, "2026-08-15", deps);
+  assert.ok(preview.rows.every((row) => row.status === "ready"));
+  assert.equal(preview.rows[0].detail.range, "'C'!D4");
+  assert.deepEqual(preview.rows[0].detail.dateUpdates, [
+    { range: "'C'!A3", value: "2026-08-14" },
+    { range: "'C'!A4", value: "2026-08-15" }
+  ]);
+  assert.match(preview.rows[0].message, /自动补充 2 个日期行/);
+
+  const writes = [];
+  const executed = await executeShelfBook({ id: "book-id", name: "架上包数据表", spreadsheetId: "book" }, "2026-08-15", {
+    ...deps,
+    batchWrite: async (_id, updates) => {
+      writes.push(...updates);
+      for (const update of updates) {
+        const target = location(update.range);
+        const sheet = values.get(`book:${target.title}`);
+        while (sheet.length <= target.row) sheet.push([]);
+        sheet[target.row][target.column] = update.value;
+      }
+    }
+  });
+
+  assert.deepEqual(writes.map((item) => item.range).sort(), ["'C'!A3", "'C'!A4", "'C'!D4", "'C'!E4", "'总表'!C2", "'总表'!D2"]);
+  assert.deepEqual(values.get("book:C").slice(2, 4).map((row) => row[0]), ["2026-08-14", "2026-08-15"]);
+  assert.ok(executed.rows.every((row) => row.status === "written"));
+});
+
+test("does not append an older missing shooter date after a newer row", async () => {
+  const values = new Map([
+    ["book:架上包 A", [["日期", "投手/包名", "服务费", "消耗", "回流消耗"], ["2026-08-15", "C", 0, 10, 1]]],
+    ["book:C", [["日期", "渠道名", "服务费", "消耗", "回流消耗"], ["2026-08-16", "A", 0, null, null]]],
+    ["book:总表", [["日期", "总消耗", "C", "C回流"], ["2026-08-15", null, null, null]]]
+  ]);
+  const deps = {
+    getWorkbook: async () => ({ properties: { title: "架上包数据表" }, sheets: [
+      { properties: { title: "架上包 A", hidden: false } },
+      { properties: { title: "C", hidden: false } },
+      { properties: { title: "总表", hidden: false } }
+    ] }),
+    getSheetValues: async (id, sheet) => values.get(`${id}:${sheet}`) || []
+  };
+
+  const preview = await collectShelfBook({ id: "book-id", name: "架上包数据表", spreadsheetId: "book" }, "2026-08-15", deps);
+  assert.ok(preview.rows.every((row) => row.status === "error"));
+  assert.match(preview.rows[0].message, /早于表内最后日期 2026-08-16/);
+});
+
 test("uses the column immediately right of a shooter code for generic return headers", async () => {
   const values = new Map([
     ["book:架上包 A", [["日期", "投手/包名", "服务费", "消耗", "回流消耗"], [46247, "C", 0, 10, 1]]],
