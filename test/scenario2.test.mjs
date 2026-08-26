@@ -68,6 +68,33 @@ test("extracts a repeated daily block and carries its merged date downward", () 
   ]);
 });
 
+test("infers a multi-row client header and prefers U-denominated spend columns", () => {
+  const values = [
+    ["", "投放人", "渠道", "", "", "前端", "", "", "", "", "", "", "", "", "", "后端", "", "", "", "", "回收"],
+    ["", "", "", "消耗+7%", "消耗（卢比）", "消耗U", "展示次数", "链接点击量", "点击率", "注册", "注册成本", "首充", "首充成本", "购物成效", "购物成本", "注册数", "注册成本", "新增充值人数", "CPA", "付费率", "ARPPU", "ROAS", "ROI", "新增充值金额", "新增提现金额", "新增提充比", "回流U"],
+    ["8月25", "W", "ko1618d11", 1.94, 193.67, 1.81, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", 0]
+  ];
+
+  const rows = extractClientRecords(values, "2026-08-25", "WINZAA");
+
+  assert.deepEqual(rows.map((row) => [row.routeCode, row.metric, row.sourceValue, row.sourceRange]), [
+    ["11", "消耗", 1.81, "'WINZAA'!F3"],
+    ["11", "回流消耗", 0, "'WINZAA'!AA3"]
+  ]);
+});
+
+test("prefers U-denominated metrics over generic columns", () => {
+  const rows = extractClientRecords([
+    ["日期", "渠道", "消耗", "消耗U", "回流", "回流U"],
+    ["8月25", "ko1618d11", 99, 1.81, 88, 0.25]
+  ], "2026-08-25", "多口径日报");
+
+  assert.deepEqual(rows.map((row) => [row.metric, row.sourceValue, row.sourceRange]), [
+    ["消耗", 1.81, "'多口径日报'!D2"],
+    ["回流消耗", 0.25, "'多口径日报'!F2"]
+  ]);
+});
+
 test("treats a client block without metric columns as blank source cells", () => {
   const rows = extractClientRecords([
     ["日期", "渠道号"],

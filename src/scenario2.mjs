@@ -21,6 +21,9 @@ function matches(value, aliases) {
 function headerScore(value, field) {
   const text = normalized(value);
   if (!text) return 0;
+  if (field === "spend" && !/\d+%|卢比|inr|服务费|累计|总消耗|实际/.test(text)
+    && /(?:消耗|花费).*(?:u|usd|usdt)$|(?:usd|usdt)(?:spend|cost)/.test(text)) return 120;
+  if (field === "returnSpend" && /(?:回流|return).*(?:u|usd|usdt)$/.test(text)) return 120;
   if (matches(value, sourceAliases[field])) return 100;
   if (field === "date") return /日期|时间|date|day/.test(text) ? 50 : 0;
   if (field === "channel") return /渠道|链名|channel/.test(text) ? 50 : 0;
@@ -30,6 +33,7 @@ function headerScore(value, field) {
   }
   if (field === "spend") {
     if (/回流|return/.test(text) || !/消耗|花费|spend|cost/.test(text)) return 0;
+    if (/\d+%|卢比|inr|服务费|累计|总消耗/.test(text)) return 30;
     return /实际|服务费|总消耗|累计/.test(text) ? 30 : 60;
   }
   return 0;
@@ -51,6 +55,69 @@ function findFieldColumns(cells) {
     spend: findFieldColumn(cells, "spend"),
     returnSpend: findFieldColumn(cells, "returnSpend")
   };
+}
+
+function findUniqueFieldColumn(cells, field) {
+  const scored = cells
+    .map((value, column) => ({ column, score: headerScore(value, field) }))
+    .filter(({ score }) => score > 0);
+  const bestScore = Math.max(0, ...scored.map(({ score }) => score));
+  const best = scored.filter(({ score }) => score === bestScore);
+  return best.length === 1 ? best[0].column : -1;
+}
+
+function looksLikeDateValue(value, businessDate) {
+  if (typeof value === "number") {
+    const year = businessDate.slice(0, 4);
+    return Number.isInteger(value) && value >= 30_000 && value <= 80_000 && (!year || dateKey(value, businessDate).startsWith(year));
+  }
+  const text = String(value ?? "").trim();
+  const match = text.match(/^(?:\d{4}[年/.-])?(\d{1,2})[月/.-](\d{1,2})日?$/);
+  if (!match) return false;
+  const month = Number(match[1]);
+  const day = Number(match[2]);
+  return month >= 1 && month <= 12 && day >= 1 && day <= 31 && Boolean(dateKey(value, businessDate));
+}
+
+function inferDateColumn(values, startRow, businessDate) {
+  const width = Math.max(0, ...values.slice(startRow, startRow + 20).map((row) => row?.length || 0));
+  const candidates = [];
+  for (let column = 0; column < width; column += 1) {
+    let matches = 0;
+    let conflicts = 0;
+    for (const row of values.slice(startRow, startRow + 20)) {
+      const value = row?.[column];
+      if (empty(value)) continue;
+      if (looksLikeDateValue(value, businessDate)) matches += 1;
+      else conflicts += 1;
+    }
+    if (matches) candidates.push({ column, score: matches * 10 - conflicts });
+  }
+  const bestScore = Math.max(-Infinity, ...candidates.map(({ score }) => score));
+  if (bestScore <= 0) return -1;
+  const best = candidates.filter(({ score }) => score === bestScore);
+  return best.length === 1 ? best[0].column : -1;
+}
+
+function inferTabularHeader(values, businessDate) {
+  const limit = Math.min(8, values.length - 1);
+  for (let row = 0; row < limit; row += 1) {
+    const band = values.slice(Math.max(0, row - 2), row + 1);
+    const width = Math.max(0, ...band.map((cells) => cells?.length || 0));
+    const composite = Array.from({ length: width }, (_, column) => band
+      .map((cells) => String(cells?.[column] ?? "").trim())
+      .filter(Boolean)
+      .join(" "));
+    const channel = findUniqueFieldColumn(composite, "channel");
+    const spend = findUniqueFieldColumn(composite, "spend");
+    const returnSpend = findUniqueFieldColumn(composite, "returnSpend");
+    const namedDate = findUniqueFieldColumn(composite, "date");
+    const date = namedDate >= 0 ? namedDate : inferDateColumn(values, row + 1, businessDate);
+    if (date >= 0 && channel >= 0 && (spend >= 0 || returnSpend >= 0)) {
+      return { row, date, channel, spend, returnSpend };
+    }
+  }
+  return null;
 }
 
 function roundMoney(value) {
@@ -138,7 +205,7 @@ export function extractBigCellRecords(values, businessDate, sourceSheet = "甲�
   return markDuplicateRecords(grouped);
 }
 
-function findHeaders(values) {
+function findHeaders(values, businessDate) {
   const headers = [];
   for (let row = 0; row < values.length; row += 1) {
     const { date, channel, spend, returnSpend } = findFieldColumns(values[row] || []);
@@ -146,7 +213,9 @@ function findHeaders(values) {
       headers.push({ row, date, channel, spend, returnSpend });
     }
   }
-  return headers;
+  const inferred = inferTabularHeader(values, businessDate);
+  if (inferred && !headers.some(({ row }) => row === inferred.row)) headers.push(inferred);
+  return headers.sort((left, right) => left.row - right.row);
 }
 
 function metricRecord(channel, route, metric, parsed, sourceSheet, row, column, missingColumnStatus = "blank") {
@@ -169,7 +238,7 @@ function metricRecord(channel, route, metric, parsed, sourceSheet, row, column, 
 }
 
 export function extractClientRecords(values, businessDate, sourceSheet = "甲方日报") {
-  const headers = findHeaders(values);
+  const headers = findHeaders(values, businessDate);
   const records = [];
   let matchedBlock = false;
   for (let index = 0; index < headers.length; index += 1) {
