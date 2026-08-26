@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $credentialPath = "C:\Program Files\safe\miulx-daily-hub.json"
-$serverUrl = "http://localhost:4173"
+$serverUrl = "http://127.0.0.1:4173"
 $healthUrl = "$serverUrl/api/bootstrap"
 $logPath = Join-Path $projectRoot "data\launcher.log"
 
@@ -56,7 +56,7 @@ function Stop-ExistingDailyService {
   $listeners = @(Get-NetTCPConnection -LocalPort 4173 -State Listen -ErrorAction SilentlyContinue)
   $ownerPids = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)
   if (-not $ownerPids) {
-    throw "The existing Daily Data Hub responded on port 4173, but its owning process could not be found. Close the old node.exe manually and try again."
+    return
   }
 
   foreach ($servicePid in $ownerPids) {
@@ -71,7 +71,7 @@ function Stop-ExistingDailyService {
 
   $graceful = $false
   try {
-    $shutdown = Invoke-RestMethod -Uri "$serverUrl/api/system/shutdown" -Method Post -ContentType "application/json" -Body "{}" -TimeoutSec 5
+    $shutdown = Invoke-RestMethod -Uri "$serverUrl/api/system/shutdown" -Method Post -ContentType "application/json" -Body "{}" -TimeoutSec 5 -Proxy $null -DisableKeepAlive
     $graceful = $shutdown.status -eq "draining"
     if ($graceful) {
       Write-LauncherLog "Graceful restart requested; waiting for the task queue to drain."
@@ -118,33 +118,31 @@ try {
     Stop-WithMessage "node.exe was not found. Install Node.js 20 or later first."
   }
 
-  $running = $false
-  $configured = $false
-  try {
-    $health = Invoke-RestMethod -Uri $healthUrl -Method Get -TimeoutSec 2
-    $running = $true
-    $configured = [bool]$health.connection.configured
-  } catch {
-    $running = $false
-  }
+  Stop-ExistingDailyService
 
-  $startedNow = $false
-  if ($running) {
-    Stop-ExistingDailyService
-    $running = $false
+  $env:GOOGLE_SERVICE_ACCOUNT_FILE = $credentialPath
+  $nodeArguments = @()
+  if ($env:HTTPS_PROXY -or $env:HTTP_PROXY) {
+    $nodeArguments += "--use-env-proxy"
   }
+  $nodeArguments += "server.mjs"
+  $windowStyle = if ($Hidden) { "Hidden" } else { "Normal" }
+  Start-Process -FilePath $node.Source -ArgumentList $nodeArguments -WorkingDirectory $projectRoot -WindowStyle $windowStyle
 
-  if (-not $running) {
-    $env:GOOGLE_SERVICE_ACCOUNT_FILE = $credentialPath
-    $nodeArguments = @()
-    if ($env:HTTPS_PROXY -or $env:HTTP_PROXY) {
-      $nodeArguments += "--use-env-proxy"
+  $serverReady = $false
+  $readyDeadline = (Get-Date).AddSeconds(30)
+  do {
+    Start-Sleep -Milliseconds 500
+    try {
+      $null = Invoke-RestMethod -Uri $healthUrl -Method Get -TimeoutSec 2 -Proxy $null -DisableKeepAlive
+      $serverReady = $true
+      break
+    } catch {
+      # The new process may still be loading.
     }
-    $nodeArguments += "server.mjs"
-    $windowStyle = if ($Hidden) { "Hidden" } else { "Normal" }
-    Start-Process -FilePath $node.Source -ArgumentList $nodeArguments -WorkingDirectory $projectRoot -WindowStyle $windowStyle
-    Start-Sleep -Seconds 2
-    $startedNow = $true
+  } while ((Get-Date) -lt $readyDeadline)
+  if (-not $serverReady) {
+    throw "The restarted Daily Data Hub did not become ready within 30 seconds. Check data\launcher.log and the Node.js process."
   }
 
   if (-not $NoBrowser) {
@@ -156,14 +154,9 @@ try {
   if (-not $proxyValue) {
     Write-LauncherLog "No local proxy detected; Google requests will use the direct connection."
   }
-  if ($startedNow) {
-    Write-LauncherLog "Started: $serverUrl; account: $($credential.client_email); proxy: $proxyValue"
-  } else {
-    Write-LauncherLog "Already running: $serverUrl; existing service was not restarted; account: $($credential.client_email); proxy: $proxyValue"
-  }
+  Write-LauncherLog "Restarted: $serverUrl; account: $($credential.client_email); proxy: $proxyValue"
   if (-not $Silent) {
-    $statusText = if ($startedNow) { "started" } else { "already running (not restarted)" }
-    Write-Host "MIULX Daily Data Hub ${statusText}: $serverUrl" -ForegroundColor Green
+    Write-Host "MIULX Daily Data Hub restarted: $serverUrl" -ForegroundColor Green
     Write-Host "Google service account: $($credential.client_email)" -ForegroundColor DarkGray
   }
 } catch {
