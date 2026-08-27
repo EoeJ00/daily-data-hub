@@ -73,6 +73,7 @@ test("aggregates one shooter across multiple rack packages and maps both metrics
       const full = values.get(`${id}:${title}`) || [];
       const cell = range.split("!")[1];
       if (!cell) return full;
+      if (/^\d+:\d+$/.test(cell)) return full.slice(0, Number(cell.split(":")[1]));
       const match = cell.match(/^([A-Z]+)(\d+)$/);
       const column = [...match[1]].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
       return [[full[Number(match[2]) - 1]?.[column]]];

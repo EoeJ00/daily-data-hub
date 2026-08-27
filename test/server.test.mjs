@@ -191,6 +191,54 @@ test("queued jobs continue after a client disconnects and do not release concurr
   assert.equal(state.scenarios["scenario-1"].runs.length, 2);
 });
 
+test("a scenario prepares at most two configurations concurrently and preserves result order", async (context) => {
+  const directory = join(import.meta.dirname, ".tmp", `concurrency-${crypto.randomUUID()}`);
+  await mkdir(directory, { recursive: true });
+  const sources = Array.from({ length: 4 }, (_, index) => ({ id: `source-${index}`, name: `source-${index}`, enabled: true }));
+  const initialState = normalizeState({ scenarios: {
+    "scenario-1": { sources, runs: [] },
+    "scenario-2": { pairs: [], runs: [] },
+    "scenario-3": { books: [], runs: [] }
+  } });
+  const store = new JsonStateStore(join(directory, "state.json"), { defaultState: initialState, normalize: normalizeState });
+  let active = 0;
+  let maximum = 0;
+  const collect = async (source, businessDate) => {
+    active += 1;
+    maximum = Math.max(maximum, active);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    active -= 1;
+    return { sourceId: source.id, sourceName: source.name, status: "success", businessDate, rows: [] };
+  };
+  const jobs = { "scenario-1": {
+    collection: "sources",
+    idsKey: "sourceIds",
+    emptyMessage: "empty",
+    collect,
+    execute: collect,
+    failed: (source, error) => ({ sourceId: source.id, status: "failed", error: error.message, rows: [] })
+  } };
+  const server = createDailyDataServer({ store, jobs });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  context.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  });
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const response = await fetch(`${baseUrl}/api/scenarios/scenario-1/jobs/preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: baseUrl },
+    body: JSON.stringify({ date: "2026-08-24" })
+  });
+  const run = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(maximum, 2);
+  assert.deepEqual(run.results.map((item) => item.sourceId), sources.map((item) => item.id));
+});
+
 test("shutdown endpoint reports queue drain before invoking the runtime callback", async (context) => {
   const queue = new JobQueue();
   let reason = "";

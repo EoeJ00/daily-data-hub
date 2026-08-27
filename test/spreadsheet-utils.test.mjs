@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { columnName, combineTargetStatuses, dateKey, inspectTarget, parseNumber, parseSheetRange, quoteSheetTitle, sheetRange } from "../src/spreadsheet-utils.mjs";
+import { columnName, combineTargetStatuses, dateKey, inspectTarget, parseNumber, parseSheetRange, planSequentialDateRows, quoteSheetTitle, sheetRange } from "../src/spreadsheet-utils.mjs";
 
 test("provides stable spreadsheet number, date, range, and status primitives", () => {
   assert.deepEqual(parseNumber("￥1,234.50"), { kind: "number", value: 1234.5 });
@@ -14,4 +14,16 @@ test("provides stable spreadsheet number, date, range, and status primitives", (
   assert.deepEqual(inspectTarget("10", 10, "'表'!A1"), { status: "same", value: 10, range: "'表'!A1" });
   assert.equal(combineTargetStatuses({ status: "same" }, { status: "written" }), "same");
   assert.equal(combineTargetStatuses({ status: "ready" }, { status: "same" }), "ready");
+});
+
+test("only appends sequential dates after the last shooter date", () => {
+  const values = [["日期"], ["2026-08-13"]];
+  assert.deepEqual(planSequentialDateRows(values, { row: 0, date: 0 }, "2026-08-15", "S"), {
+    row: 3,
+    updates: [
+      { range: "'S'!A3", value: "2026-08-14" },
+      { range: "'S'!A4", value: "2026-08-15" }
+    ]
+  });
+  assert.match(planSequentialDateRows(values, { row: 0, date: 0 }, "2026-08-12", "S").error, /无法向下追加/);
 });

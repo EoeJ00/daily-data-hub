@@ -30,7 +30,14 @@ test("collects channel metrics and writes only ready target cells", async () => 
       { properties: { title: "总表", hidden: false } },
       { properties: { title: "渠道A(C)", hidden: false } }
     ] }),
-    getSheetValuesBatch: async (_id, ranges) => ranges.map((range) => values[range.slice(1, -1)] || []),
+    getSheetValuesBatch: async (_id, ranges) => ranges.map((range) => {
+      const [sheetPart, selector] = range.split("!");
+      const rows = values[sheetPart.slice(1, -1)] || [];
+      if (!selector) return rows;
+      if (/^\d+:\d+$/.test(selector)) return rows.slice(0, Number(selector.split(":")[1]));
+      const column = [...selector.split(":")[0]].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
+      return rows.map((row) => [row[column]]);
+    }),
     batchWrite: async (_id, updates) => writes.push(...updates)
   };
 

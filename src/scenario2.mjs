@@ -1,6 +1,6 @@
 import { batchWrite, getSheetValues, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
 import { mapConcurrent } from "./async-utils.mjs";
-import { combineTargetStatuses as combineStatus, dateKey, inspectTarget as inspectSpreadsheetTarget, isEmpty as empty, parseNumber as parseSpreadsheetNumber, quoteSheetTitle, sheetRange } from "./spreadsheet-utils.mjs";
+import { combineTargetStatuses as combineStatus, dateKey, inspectTarget as inspectSpreadsheetTarget, isEmpty as empty, mergeProjectedColumns, parseNumber as parseSpreadsheetNumber, planSequentialDateRows, quoteSheetTitle, sheetColumnRange, sheetRange } from "./spreadsheet-utils.mjs";
 import { looseRouteScore, normalizeRoute, normalizeScenarioText as normalized, routeIdentity, routeScore, shooterFallbackScore, totalChainScore } from "./scenario2-route.mjs";
 
 export { dateKey } from "./spreadsheet-utils.mjs";
@@ -218,6 +218,15 @@ function findHeaders(values, businessDate) {
   return headers.sort((left, right) => left.row - right.row);
 }
 
+async function readProjectedClientValues(spreadsheetId, sheetTitle, businessDate, deps) {
+  const values = await readProjectedSheetMap(spreadsheetId, [sheetTitle], deps, (sample) => {
+    const headers = findHeaders(sample, businessDate);
+    if (!headers.length) return null;
+    return [...new Set(headers.flatMap(({ date, channel, spend, returnSpend }) => [date, channel, spend, returnSpend]).filter((column) => column >= 0))];
+  });
+  return values.get(sheetTitle) || [];
+}
+
 function metricRecord(channel, route, metric, parsed, sourceSheet, row, column, missingColumnStatus = "blank") {
   const identity = { channel, routeCode: route.code, routeChain: routeIdentity(route), shooter: route.shooter, metric, sourceSheet };
   if (column < 0) {
@@ -362,10 +371,6 @@ function findDetailHeader(values) {
   return null;
 }
 
-function findDateRow(values, header, businessDate) {
-  return values.findIndex((row, index) => index > header.row && dateKey(row?.[header.date], businessDate) === businessDate);
-}
-
 function inspectTarget(value, sourceValue, range) {
   return inspectSpreadsheetTarget(value, sourceValue, range, parseNumber);
 }
@@ -425,7 +430,11 @@ async function collectChainSheetRecords(pair, businessDate, clientSheets, ownDes
   const matchedTitles = [...new Set(ownDescriptors.details
     .map((descriptor) => getMatch(descriptor).sheet?.title)
     .filter(Boolean))];
-  const clientValues = await readSheetMap(pair.client.spreadsheetId, matchedTitles, deps);
+  const clientValues = await readProjectedSheetMap(pair.client.spreadsheetId, matchedTitles, deps, (sample) => {
+    const headers = findStandaloneHeaders(sample);
+    if (!headers.length) return null;
+    return [...new Set(headers.flatMap(({ date, channel, spend, returnSpend }) => [date, channel, spend, returnSpend]).filter((column) => column >= 0))];
+  });
   const rows = [];
   for (const descriptor of ownDescriptors.details) {
     const match = getMatch(descriptor);
@@ -498,12 +507,28 @@ async function readSheetMap(spreadsheetId, titles, deps, options = {}) {
   ], 6));
 }
 
+async function readProjectedSheetMap(spreadsheetId, titles, deps, identifyColumns, options = {}) {
+  const uniqueTitles = [...new Set(titles)];
+  if (!deps.getSheetValuesBatch) return readSheetMap(spreadsheetId, uniqueTitles, deps, options);
+  const samples = await deps.getSheetValuesBatch(spreadsheetId, uniqueTitles.map((title) => `${quoteSheetTitle(title)}!1:20`), options);
+  const specs = uniqueTitles.map((title, index) => ({ title, sample: samples[index] || [], columns: identifyColumns(samples[index] || [], title) }));
+  const ranges = specs.flatMap(({ title, columns }) => columns === null
+    ? [quoteSheetTitle(title)]
+    : columns.map((column) => sheetColumnRange(title, column)));
+  const values = await deps.getSheetValuesBatch(spreadsheetId, ranges, options);
+  let cursor = 0;
+  return new Map(specs.map(({ title, sample, columns }) => {
+    if (columns === null) return [title, values[cursor++] || []];
+    const sheetValues = mergeProjectedColumns(columns, values.slice(cursor, cursor + columns.length), sample);
+    cursor += columns.length;
+    return [title, sheetValues];
+  }));
+}
+
 async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
   const { totalSheet, details } = detailDescriptors(ownWorkbook, pair.targetSheet || "总表");
   if (!totalSheet) throw new Error(`自己的日报表未找到目标页签：${pair.targetSheet || "总表"}`);
   const targetDescriptors = details;
-  const totalValues = (await readSheetMap(pair.own.spreadsheetId, [totalSheet.title], deps, { valueRenderOption: "FORMATTED_VALUE" })).get(totalSheet.title) || [];
-  const totalTarget = locateTotal(totalValues, businessDate);
   const matchCache = new Map();
   const getMatch = (row) => {
     const key = `${row.channel}\u0000${row.shooter || ""}`;
@@ -514,7 +539,24 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
     .filter((row) => row.status === "pending")
     .map((row) => getMatch(row).descriptor?.sheet.title)
     .filter(Boolean))];
-  const detailCache = await readSheetMap(pair.own.spreadsheetId, matchedSheets, deps);
+  const targetValues = await readProjectedSheetMap(pair.own.spreadsheetId, [totalSheet.title, ...matchedSheets], deps, (sample, title) => {
+    if (title === totalSheet.title) {
+      const target = locateTotal(sample, businessDate);
+      if (!target) return [];
+      const columns = new Set([target.dateColumn]);
+      for (const row of sourceRows.filter((item) => item.status === "pending")) {
+        const descriptor = getMatch(row).descriptor;
+        const column = descriptor ? locateTotalColumn(sample, target, descriptor.route, row.metric) : -1;
+        if (column >= 0) columns.add(column);
+      }
+      return [...columns];
+    }
+    const header = findDetailHeader(sample);
+    return header ? [...new Set([header.date, header.channel, header.spend, header.returnSpend].filter((column) => column >= 0))] : [];
+  }, { valueRenderOption: "FORMATTED_VALUE" });
+  const totalValues = targetValues.get(totalSheet.title) || [];
+  const totalTarget = locateTotal(totalValues, businessDate);
+  const detailCache = targetValues;
   const detailMetaCache = new Map();
   const totalColumnCache = new Map();
   const rows = [];
@@ -535,19 +577,20 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
     if (!detailMeta) {
       const detailHeader = findDetailHeader(detailValues);
       detailMeta = detailHeader
-        ? { detailHeader, detailDateRow: findDateRow(detailValues, detailHeader, businessDate) }
-        : { detailHeader: null, detailDateRow: -1 };
+        ? { detailHeader, detailDatePlan: planSequentialDateRows(detailValues, detailHeader, businessDate, detailSheet) }
+        : { detailHeader: null, detailDatePlan: null };
       detailMetaCache.set(detailSheet, detailMeta);
     }
-    const { detailHeader, detailDateRow } = detailMeta;
+    const { detailHeader, detailDatePlan } = detailMeta;
     if (!detailHeader) {
       rows.push({ ...row, targetSheet: detailSheet, status: "error", message: "投手页签未找到日期、渠道号、花费和回流表头" });
       continue;
     }
-    if (detailDateRow < 0) {
-      rows.push({ ...row, targetSheet: detailSheet, status: "error", message: `投手页签缺少 ${businessDate} 日期行` });
+    if (detailDatePlan.error) {
+      rows.push({ ...row, targetSheet: detailSheet, status: "error", message: detailDatePlan.error });
       continue;
     }
+    const detailDateRow = detailDatePlan.row;
     const channelCell = detailValues[detailDateRow]?.[detailHeader.channel];
     const targetRoute = normalizeRoute(channelCell);
     if (!empty(channelCell) && routeScore(targetRoute, match.descriptor.route) === 0) {
@@ -559,7 +602,11 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
       rows.push({ ...row, targetSheet: detailSheet, status: "error", message: `投手页签缺少${row.metric}列` });
       continue;
     }
-    const detail = inspectTarget(detailValues[detailDateRow]?.[detailColumn], row.sourceValue, sheetRange(detailSheet, detailDateRow, detailColumn));
+    const detail = {
+      ...inspectTarget(detailValues[detailDateRow]?.[detailColumn], row.sourceValue, sheetRange(detailSheet, detailDateRow, detailColumn)),
+      dateUpdates: detailDatePlan.updates,
+      message: detailDatePlan.updates.length ? `将自动补充 ${detailDatePlan.updates.length} 个日期行至 ${businessDate}` : undefined
+    };
     let total;
     if (!totalTarget || totalTarget.dateRow < 0) {
       total = { status: "error", range: "", value: null, message: `总表缺少 ${businessDate} 日期行` };
@@ -630,7 +677,7 @@ export async function collectScenario2Pair(pair, businessDate, deps = defaultDep
   let sourceSheet = "多链独立工作表";
   if (!sourceRows) {
     const selected = clientSheets.find((sheet) => String(sheet.sheetId) === String(pair.client.gid)) || clientSheets[0];
-    const clientValues = await deps.getSheetValues(pair.client.spreadsheetId, selected.title);
+    const clientValues = await readProjectedClientValues(pair.client.spreadsheetId, selected.title, businessDate, deps);
     sourceRows = extractClientRecords(clientValues, businessDate, selected.title);
     if (sourceRows.some((row) => row.metric === "结构" && row.status === "error")) {
       sourceRows = sourceRows.map((row) => row.metric === "结构" && row.status === "error"
@@ -659,9 +706,13 @@ export async function collectScenario2Pair(pair, businessDate, deps = defaultDep
 export async function executeScenario2Pair(pair, businessDate, deps = defaultDeps) {
   const runDeps = withWorkbookCache(deps);
   const preview = await collectScenario2Pair(pair, businessDate, runDeps);
-  const detailUpdates = preview.rows
-    .filter((row) => row.status === "ready" && row.detail?.status === "ready" && row.total?.status !== "conflict" && row.total?.status !== "error")
-    .map((row) => ({ range: row.detail.range, value: row.sourceValue }));
+  const readyDetails = preview.rows
+    .filter((row) => row.status === "ready" && row.detail?.status === "ready" && row.total?.status !== "conflict" && row.total?.status !== "error");
+  const dateUpdates = [...new Map(readyDetails.flatMap((row) => row.detail.dateUpdates || []).map((update) => [update.range, update])).values()];
+  const detailUpdates = [
+    ...dateUpdates,
+    ...readyDetails.map((row) => ({ range: row.detail.range, value: row.sourceValue }))
+  ];
   await runDeps.batchWrite(pair.own.spreadsheetId, detailUpdates);
 
   const afterDetail = await collectScenario2Pair(pair, businessDate, runDeps);

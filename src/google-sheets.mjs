@@ -8,6 +8,32 @@ let tokenRequest;
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const READ_ATTEMPTS = 4;
 const DEFAULT_READ_INTERVAL_MS = 1_200;
+const WORKBOOK_CACHE_TTL_MS = 10 * 60_000;
+const HEADER_CACHE_TTL_MS = 5 * 60_000;
+
+export function createPromiseCache(ttl, now = () => Date.now()) {
+  const entries = new Map();
+  return {
+    get(key, load) {
+      const cached = entries.get(key);
+      if (cached?.expiresAt > now()) return cached.promise;
+      if (cached) entries.delete(key);
+      const promise = Promise.resolve().then(load).catch((error) => {
+        if (entries.get(key)?.promise === promise) entries.delete(key);
+        throw error;
+      });
+      entries.set(key, { expiresAt: now() + ttl, promise });
+      return promise;
+    },
+    clear(prefix) {
+      if (prefix === undefined) return entries.clear();
+      for (const key of entries.keys()) if (key.startsWith(prefix)) entries.delete(key);
+    }
+  };
+}
+
+const workbookMetadataCache = createPromiseCache(WORKBOOK_CACHE_TTL_MS);
+const headerValuesCache = createPromiseCache(HEADER_CACHE_TTL_MS);
 
 function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -157,7 +183,12 @@ async function googleRequest(path, options = {}) {
 
 export async function getWorkbook(spreadsheetId) {
   const fields = "properties(title,timeZone),sheets(properties(sheetId,title,index,hidden))";
-  return googleRequest(`spreadsheets/${spreadsheetId}?fields=${encodeURIComponent(fields)}`);
+  return workbookMetadataCache.get(`${spreadsheetId}\u0000`, () => googleRequest(`spreadsheets/${spreadsheetId}?fields=${encodeURIComponent(fields)}`));
+}
+
+export function clearWorkbookMetadataCache(spreadsheetId) {
+  workbookMetadataCache.clear(spreadsheetId ? `${spreadsheetId}\u0000` : undefined);
+  headerValuesCache.clear(spreadsheetId ? `${spreadsheetId}\u0000` : undefined);
 }
 
 export async function getSheetValues(spreadsheetId, sheetTitle, options = {}) {
@@ -177,9 +208,14 @@ export async function getSheetValues(spreadsheetId, sheetTitle, options = {}) {
 export async function getSheetValuesBatch(spreadsheetId, ranges, options = {}) {
   if (!ranges.length) return [];
   const valueRenderOption = options.valueRenderOption || "UNFORMATTED_VALUE";
-  const query = ranges.map((range) => `ranges=${encodeURIComponent(range)}`).join("&");
-  const data = await googleRequest(`spreadsheets/${spreadsheetId}/values:batchGet?${query}&majorDimension=ROWS&valueRenderOption=${encodeURIComponent(valueRenderOption)}`);
-  return (data.valueRanges || []).map((item) => item.values || []);
+  const load = async () => {
+    const query = ranges.map((range) => `ranges=${encodeURIComponent(range)}`).join("&");
+    const data = await googleRequest(`spreadsheets/${spreadsheetId}/values:batchGet?${query}&majorDimension=ROWS&valueRenderOption=${encodeURIComponent(valueRenderOption)}`);
+    return (data.valueRanges || []).map((item) => item.values || []);
+  };
+  const headerOnly = ranges.every((range) => /!1:\d+$/.test(range));
+  const cacheKey = headerOnly ? `${spreadsheetId}\u0000${valueRenderOption}\u0000${ranges.join("\u0000")}` : "";
+  return cacheKey ? headerValuesCache.get(cacheKey, load) : load();
 }
 
 export async function batchWrite(spreadsheetId, updates) {

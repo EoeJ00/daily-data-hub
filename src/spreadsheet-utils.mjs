@@ -40,8 +40,57 @@ export function quoteSheetTitle(title) {
   return `'${String(title ?? "").replaceAll("'", "''")}'`;
 }
 
+export function sheetHeaderRange(title, rows = 20) {
+  return `${quoteSheetTitle(title)}!1:${rows}`;
+}
+
+export function sheetColumnRange(title, column) {
+  const name = columnName(column);
+  return `${quoteSheetTitle(title)}!${name}:${name}`;
+}
+
+export function mergeProjectedColumns(columns, valueRanges, sample = []) {
+  const rows = sample.map((row) => [...row]);
+  columns.forEach((column, rangeIndex) => {
+    (valueRanges[rangeIndex] || []).forEach((row, rowIndex) => {
+      if (!rows[rowIndex]) rows[rowIndex] = [];
+      rows[rowIndex][column] = row?.[0];
+    });
+  });
+  return rows;
+}
+
 export function sheetRange(title, row, column) {
   return `${quoteSheetTitle(title)}!${columnName(column)}${row + 1}`;
+}
+
+export function planSequentialDateRows(values, header, businessDate, sheetTitle) {
+  const existingRow = values.findIndex((row, index) => index > header.row && dateKey(row?.[header.date], businessDate) === businessDate);
+  if (existingRow >= 0) return { row: existingRow, updates: [] };
+
+  const datedRows = [];
+  for (let row = header.row + 1; row < values.length; row += 1) {
+    const date = dateKey(values[row]?.[header.date], businessDate);
+    if (date) datedRows.push({ row, date });
+  }
+  const last = datedRows.at(-1);
+  if (!last) {
+    const row = header.row + 1;
+    return { row, updates: [{ range: sheetRange(sheetTitle, row, header.date), value: businessDate }] };
+  }
+
+  const lastTime = Date.parse(`${last.date}T00:00:00Z`);
+  const targetTime = Date.parse(`${businessDate}T00:00:00Z`);
+  if (!Number.isFinite(lastTime) || !Number.isFinite(targetTime)) return { error: `无法解析投手消耗表日期：${last.date} → ${businessDate}` };
+  if (targetTime <= lastTime) return { error: `投手消耗表缺少 ${businessDate} 日期行，且该日期早于表内最后日期 ${last.date}，无法向下追加` };
+
+  const dayCount = Math.round((targetTime - lastTime) / 86_400_000);
+  const updates = Array.from({ length: dayCount }, (_, index) => {
+    const row = last.row + index + 1;
+    const value = new Date(lastTime + (index + 1) * 86_400_000).toISOString().slice(0, 10);
+    return { range: sheetRange(sheetTitle, row, header.date), value };
+  });
+  return { row: last.row + dayCount, updates };
 }
 
 export function parseSheetRange(range) {

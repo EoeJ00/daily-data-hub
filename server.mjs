@@ -6,9 +6,10 @@ import { fileURLToPath } from "node:url";
 import { collectWorkbook, executeWorkbook } from "./src/collector.mjs";
 import { collectScenario2Pair, executeScenario2Pair } from "./src/scenario2.mjs";
 import { collectShelfBook, executeShelfBook } from "./src/shelf-pack.mjs";
-import { getConnectionStatus } from "./src/google-sheets.mjs";
+import { clearWorkbookMetadataCache, getConnectionStatus } from "./src/google-sheets.mjs";
 import { JsonStateStore } from "./src/state-store.mjs";
 import { JobQueue } from "./src/job-queue.mjs";
+import { mapConcurrent } from "./src/async-utils.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = join(root, "public");
@@ -168,7 +169,9 @@ function httpError(status, message) {
 
 async function sendStateMutation(response, mutator, store = stateStore) {
   try {
-    return sendJson(response, 200, await store.mutate(mutator));
+    const result = await store.mutate(mutator);
+    clearWorkbookMetadataCache();
+    return sendJson(response, 200, result);
   } catch (error) {
     return sendJson(response, error.status || 400, { error: error.message });
   }
@@ -248,14 +251,13 @@ const jobDefinitions = {
 
 async function executeScenarioJob({ scenario, type, businessDate, selected, definition, store }) {
   const execute = type === "run";
-  const results = [];
-  for (const item of selected) {
+  const results = await mapConcurrent(selected, async (item) => {
     try {
-      results.push(await (execute ? definition.execute(item, businessDate) : definition.collect(item, businessDate)));
+      return await (execute ? definition.execute(item, businessDate) : definition.collect(item, businessDate));
     } catch (error) {
-      results.push(definition.failed(item, error));
+      return definition.failed(item, error);
     }
-  }
+  }, 2);
   const run = {
     id: crypto.randomUUID(),
     type: execute ? "run" : "preview",
@@ -323,6 +325,7 @@ async function importSources(request, response, store) {
     }
     return { scenario: "scenario-1", results, sources: scope.sources };
   });
+  clearWorkbookMetadataCache();
   return sendJson(response, 200, payload);
 }
 

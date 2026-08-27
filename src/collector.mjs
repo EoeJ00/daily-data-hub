@@ -1,5 +1,5 @@
 import { batchWrite, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
-import { dateKey, isEmpty as empty, normalizeText as normalized, parseNumber, quoteSheetTitle, sheetRange } from "./spreadsheet-utils.mjs";
+import { dateKey, isEmpty as empty, mergeProjectedColumns, normalizeText as normalized, parseNumber, sheetColumnRange, sheetHeaderRange, sheetRange } from "./spreadsheet-utils.mjs";
 
 function channelColumnName(channel) {
   const displayName = String(channel ?? "").trim();
@@ -49,7 +49,7 @@ function locateTarget(values, businessDate) {
     const dateColumn = (values[row] || []).findIndex((cell) => matches(cell, ["日期", "时间", "date"]));
     if (dateColumn < 0) continue;
     const dateRow = values.findIndex((cells, index) => index > row && dateKey(cells[dateColumn], businessDate) === businessDate);
-    return { headerRow: row, dateRow };
+    return { headerRow: row, dateColumn, dateRow };
   }
   return null;
 }
@@ -103,9 +103,30 @@ export async function collectWorkbook(source, businessDate, deps = defaultDeps) 
   if (!visibleSheets.includes(source.targetSheet)) throw new Error(`未找到目标页签：${source.targetSheet}`);
   const channels = visibleSheets.filter((title) => !source.excludedSheets.includes(title));
   const titles = [...new Set([source.targetSheet, ...channels])];
-  const ranges = titles.map(quoteSheetTitle);
-  const values = await deps.getSheetValuesBatch(source.spreadsheetId, ranges);
-  const valuesByTitle = new Map(titles.map((title, index) => [title, values[index] || []]));
+  const samples = await deps.getSheetValuesBatch(source.spreadsheetId, titles.map((title) => sheetHeaderRange(title)));
+  const sampleByTitle = new Map(titles.map((title, index) => [title, samples[index] || []]));
+  const targetSample = sampleByTitle.get(source.targetSheet) || [];
+  const targetHeader = locateTarget(targetSample, businessDate);
+  const targetColumns = new Set(targetHeader ? [targetHeader.dateColumn] : []);
+  for (const channel of channels) {
+    for (const metric of ["消耗", "回流消耗"]) {
+      const column = targetHeader ? locateMetricColumn(targetSample, targetHeader, channel, metric) : -1;
+      if (column >= 0) targetColumns.add(column);
+    }
+  }
+  const specs = titles.map((title) => {
+    if (title === source.targetSheet) return { title, columns: [...targetColumns] };
+    const header = findSourceHeader(sampleByTitle.get(title) || [], source.aliases);
+    return { title, columns: header ? [...new Set([header.date, header.spend, header.returnSpend].filter((column) => column >= 0))] : [] };
+  });
+  const ranges = specs.flatMap(({ title, columns }) => columns.map((column) => sheetColumnRange(title, column)));
+  const projected = await deps.getSheetValuesBatch(source.spreadsheetId, ranges);
+  let cursor = 0;
+  const valuesByTitle = new Map(specs.map(({ title, columns }) => {
+    const values = mergeProjectedColumns(columns, projected.slice(cursor, cursor + columns.length), sampleByTitle.get(title));
+    cursor += columns.length;
+    return [title, values];
+  }));
   const targetValues = valuesByTitle.get(source.targetSheet) || [];
   const target = locateTarget(targetValues, businessDate);
   const channelValues = channels.map((channel) => ({ channel, values: valuesByTitle.get(channel) || [] }));

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createRequestScheduler, fetchJson } from "../src/google-sheets.mjs";
+import { createPromiseCache, createRequestScheduler, fetchJson } from "../src/google-sheets.mjs";
 
 function jsonResponse(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
@@ -104,4 +104,19 @@ test("request scheduler serializes reads at the configured interval", async () =
 
   assert.deepEqual(starts, [0, 1_200, 2_400]);
   assert.deepEqual(delays, [1_200, 1_200]);
+});
+
+test("promise cache deduplicates concurrent loads and expires predictably", async () => {
+  let currentTime = 0;
+  let loads = 0;
+  const cache = createPromiseCache(300_000, () => currentTime);
+  const load = async () => ++loads;
+
+  assert.deepEqual(await Promise.all([cache.get("sheet", load), cache.get("sheet", load)]), [1, 1]);
+  currentTime = 299_999;
+  assert.equal(await cache.get("sheet", load), 1);
+  currentTime = 300_000;
+  assert.equal(await cache.get("sheet", load), 2);
+  cache.clear("sheet");
+  assert.equal(await cache.get("sheet", load), 3);
 });

@@ -169,6 +169,7 @@ function scenario2Fixture() {
         const rows = values.get(`${id}:${match[1].replaceAll("''", "'")}`);
         const row = Number(match[3]) - 1;
         const column = columnIndex(match[2]);
+        while (rows.length <= row) rows.push([]);
         rows[row][column] = update.value;
       }
       return { totalUpdatedCells: updates.length };
@@ -176,7 +177,8 @@ function scenario2Fixture() {
   };
   return {
     pair: { id: "pair", name: "测试配对", client: { spreadsheetId: clientId, gid: "1" }, own: { spreadsheetId: ownId }, targetSheet: "总表" },
-    deps
+    deps,
+    values
   };
 }
 
@@ -187,6 +189,29 @@ test("maps a client daily block to unique shooter sheets and total columns", asy
   assert.equal(preview.rows.length, 4);
   assert.ok(preview.rows.every((row) => row.status === "ready"));
   assert.equal(preview.rows.find((row) => row.routeCode === "37" && row.metric === "消耗").targetSheet, "37(YC)");
+});
+
+test("batches total and matched shooter sheets into two own-workbook reads", async () => {
+  const { pair, deps, values } = scenario2Fixture();
+  const calls = { client: 0, own: 0 };
+  const columnIndex = (letters) => [...letters].reduce((sum, letter) => sum * 26 + letter.charCodeAt(0) - 64, 0) - 1;
+  const getSheetValuesBatch = async (id, ranges) => {
+    calls[id] += 1;
+    return ranges.map((range) => {
+      const [sheetPart, selector] = range.split("!");
+      const title = sheetPart.slice(1, -1).replaceAll("''", "'");
+      const rows = values.get(`${id}:${title}`) || [];
+      if (!selector) return rows;
+      if (/^\d+:\d+$/.test(selector)) return rows.slice(0, Number(selector.split(":")[1]));
+      const column = columnIndex(selector.split(":")[0]);
+      return rows.map((row) => [row[column]]);
+    });
+  };
+
+  const preview = await collectScenario2Pair(pair, "2026-08-13", { ...deps, getSheetValuesBatch });
+  assert.equal(preview.rows.length, 4);
+  assert.equal(calls.client, 2);
+  assert.equal(calls.own, 2);
 });
 
 test("matches semantic fields and compound channel suffixes without workbook-specific rules", async () => {
@@ -252,6 +277,26 @@ test("writes detail rows first, rechecks them, and then writes the total", async
   assert.ok(result.rows.every((row) => row.status === "written"));
   assert.ok(result.rows.every((row) => row.detail.status === "same" && row.total.status === "same"));
   assert.equal(workbookReads, 2);
+});
+
+test("appends missing shooter dates in sequence before multi-table writes", async () => {
+  const { pair, deps, values } = scenario2Fixture();
+  const client = values.get("client:BI（日报总表）");
+  client[2][0] = 46249;
+  values.get("own:总表")[1][0] = 46249;
+
+  const preview = await collectScenario2Pair(pair, "2026-08-15", deps);
+  assert.ok(preview.rows.every((row) => row.status === "ready"));
+  assert.deepEqual(preview.rows.find((row) => row.targetSheet === "34(ROY)").detail.dateUpdates, [
+    { range: "'34(ROY)'!A4", value: "2026-08-14" },
+    { range: "'34(ROY)'!A5", value: "2026-08-15" }
+  ]);
+  assert.match(preview.rows[0].message, /自动补充 2 个日期行/);
+
+  const result = await executeScenario2Pair(pair, "2026-08-15", deps);
+  assert.ok(result.rows.every((row) => row.status === "written"));
+  assert.deepEqual(values.get("own:34(ROY)").slice(3, 5).map((row) => row[0]), ["2026-08-14", "2026-08-15"]);
+  assert.deepEqual(values.get("own:37(YC)").slice(3, 5).map((row) => row[0]), ["2026-08-14", "2026-08-15"]);
 });
 
 test("ignores hidden own and client chain sheets during matching", async () => {
