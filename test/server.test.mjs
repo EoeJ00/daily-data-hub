@@ -239,6 +239,65 @@ test("a scenario prepares at most two configurations concurrently and preserves 
   assert.deepEqual(run.results.map((item) => item.sourceId), sources.map((item) => item.id));
 });
 
+test("previews use materialized snapshots while runs keep the live execution path", async (context) => {
+  const directory = join(import.meta.dirname, ".tmp", `snapshot-server-${crypto.randomUUID()}`);
+  await mkdir(directory, { recursive: true });
+  const source = { id: "source", name: "测试表", enabled: true };
+  const store = new JsonStateStore(join(directory, "state.json"), { defaultState: normalizeState({ scenarios: {
+    "scenario-1": { sources: [source], runs: [] },
+    "scenario-2": { pairs: [], runs: [] },
+    "scenario-3": { books: [], runs: [] }
+  } }), normalize: normalizeState });
+  let liveRuns = 0;
+  let snapshotReads = 0;
+  let refreshes = 0;
+  const result = { sourceId: source.id, sourceName: source.name, status: "success", rows: [] };
+  const jobs = { "scenario-1": {
+    collection: "sources",
+    idsKey: "sourceIds",
+    emptyMessage: "empty",
+    collect: async () => { throw new Error("预览不应实时读取"); },
+    execute: async () => { liveRuns += 1; return result; },
+    failed: (_item, error) => ({ status: "failed", error: error.message, rows: [] })
+  } };
+  const snapshots = {
+    preview: async () => { snapshotReads += 1; return { ...result, snapshot: { mode: "materialized", syncedAt: new Date().toISOString() } }; },
+    refreshAfterWrite: async () => { refreshes += 1; },
+    status: () => ({ running: true }),
+    wake() {}
+  };
+  const queue = new JobQueue();
+  let releaseBlocker;
+  const blocker = queue.enqueue(() => new Promise((resolve) => { releaseBlocker = resolve; }), { type: "run" });
+  while (!queue.snapshot().running) await new Promise((resolve) => setImmediate(resolve));
+  const server = createDailyDataServer({ store, jobs, snapshots, queue });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  context.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  });
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const request = (type) => fetch(`${baseUrl}/api/scenarios/scenario-1/jobs/${type}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: baseUrl },
+    body: JSON.stringify({ date: "2026-08-27" })
+  });
+
+  const previewResponse = await request("preview");
+  assert.equal(previewResponse.status, 200);
+  assert.equal(previewResponse.headers.get("x-data-source"), "materialized-snapshot");
+  releaseBlocker();
+  await blocker.promise;
+  assert.equal((await request("run")).status, 200);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(snapshotReads, 1);
+  assert.equal(liveRuns, 1);
+  assert.equal(refreshes, 1);
+});
+
 test("shutdown endpoint reports queue drain before invoking the runtime callback", async (context) => {
   const queue = new JobQueue();
   let reason = "";

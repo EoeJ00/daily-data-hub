@@ -1,4 +1,5 @@
 data/state.json
+data/snapshots.json
 data/launcher.log
 .env
 node_modules/

@@ -10,11 +10,13 @@ import { clearWorkbookMetadataCache, getConnectionStatus } from "./src/google-sh
 import { JsonStateStore } from "./src/state-store.mjs";
 import { JobQueue } from "./src/job-queue.mjs";
 import { mapConcurrent } from "./src/async-utils.mjs";
+import { MaterializedSnapshotStore, SnapshotSynchronizer } from "./src/materialized-snapshots.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = join(root, "public");
 const dataDir = join(root, "data");
 const stateFile = join(dataDir, "state.json");
+const snapshotFile = join(dataDir, "snapshots.json");
 const port = Number(process.env.PORT || 4173);
 const host = process.env.HOST || "127.0.0.1";
 
@@ -167,10 +169,11 @@ function httpError(status, message) {
   return Object.assign(new Error(message), { status });
 }
 
-async function sendStateMutation(response, mutator, store = stateStore) {
+async function sendStateMutation(response, mutator, store = stateStore, onChanged) {
   try {
     const result = await store.mutate(mutator);
     clearWorkbookMetadataCache();
+    onChanged?.();
     return sendJson(response, 200, result);
   } catch (error) {
     return sendJson(response, error.status || 400, { error: error.message });
@@ -198,7 +201,7 @@ function matchEntityRoute(pathname) {
   return null;
 }
 
-async function patchEntity(request, response, definition, id, store) {
+async function patchEntity(request, response, definition, id, store, onChanged) {
   const changes = await readJson(request);
   return sendStateMutation(response, (state) => {
     const items = scenarioState(state, definition.scenario)[definition.collection];
@@ -208,10 +211,10 @@ async function patchEntity(request, response, definition, id, store) {
       if (key in changes) item[key] = changes[key];
     }
     return { [definition.itemKey]: item };
-  }, store);
+  }, store, onChanged);
 }
 
-async function deleteEntity(response, definition, id, store) {
+async function deleteEntity(response, definition, id, store, onChanged) {
   return sendStateMutation(response, (state) => {
     const scope = scenarioState(state, definition.scenario);
     const items = scope[definition.collection];
@@ -219,7 +222,7 @@ async function deleteEntity(response, definition, id, store) {
     if (remaining.length === items.length) throw httpError(404, definition.notFound);
     scope[definition.collection] = remaining;
     return { ...definition.deleteExtra, [definition.collection]: remaining };
-  }, store);
+  }, store, onChanged);
 }
 
 const jobDefinitions = {
@@ -249,15 +252,21 @@ const jobDefinitions = {
   }
 };
 
-async function executeScenarioJob({ scenario, type, businessDate, selected, definition, store }) {
+async function executeScenarioJob({ scenario, type, businessDate, selected, definition, store, snapshots }) {
   const execute = type === "run";
   const results = await mapConcurrent(selected, async (item) => {
     try {
-      return await (execute ? definition.execute(item, businessDate) : definition.collect(item, businessDate));
+      if (execute) return await definition.execute(item, businessDate);
+      return snapshots
+        ? await snapshots.preview(scenario, item, businessDate, definition.collect)
+        : await definition.collect(item, businessDate);
     } catch (error) {
       return definition.failed(item, error);
     }
   }, 2);
+  if (execute && snapshots) {
+    await Promise.all(selected.map((item) => snapshots.refreshAfterWrite(scenario, item, businessDate, definition.collect).catch(() => {})));
+  }
   const run = {
     id: crypto.randomUUID(),
     type: execute ? "run" : "preview",
@@ -274,7 +283,7 @@ async function executeScenarioJob({ scenario, type, businessDate, selected, defi
   return run;
 }
 
-async function runScenarioJob(request, response, scenario, type, store, queue, definitions) {
+async function runScenarioJob(request, response, scenario, type, store, queue, definitions, snapshots) {
   const definition = definitions[scenario];
   const body = await readJson(request);
   const businessDate = body.date || new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
@@ -284,8 +293,12 @@ async function runScenarioJob(request, response, scenario, type, store, queue, d
     .filter((item) => item.enabled && (!ids.length || ids.includes(item.id)));
   if (!selected.length) return sendJson(response, 400, { error: definition.emptyMessage });
   try {
+    if (type === "preview" && snapshots) {
+      response.setHeader("x-data-source", "materialized-snapshot");
+      return sendJson(response, 200, await executeScenarioJob({ scenario, type, businessDate, selected, definition, store, snapshots }));
+    }
     const queued = queue.enqueue(
-      () => executeScenarioJob({ scenario, type, businessDate, selected, definition, store }),
+      () => executeScenarioJob({ scenario, type, businessDate, selected, definition, store, snapshots }),
       { scenario, type, businessDate }
     );
     response.setHeader("x-job-id", queued.id);
@@ -296,7 +309,7 @@ async function runScenarioJob(request, response, scenario, type, store, queue, d
   }
 }
 
-async function importSources(request, response, store) {
+async function importSources(request, response, store, onChanged) {
   const { text = "", name = "" } = await readJson(request);
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   if (!lines.length) return sendJson(response, 400, { error: "请至少输入一个 Google 表格链接" });
@@ -326,12 +339,13 @@ async function importSources(request, response, store) {
     return { scenario: "scenario-1", results, sources: scope.sources };
   });
   clearWorkbookMetadataCache();
+  onChanged?.();
   return sendJson(response, 200, payload);
 }
 
 async function handleApi(request, response, pathname, store, runtime) {
   if (request.method === "GET" && pathname === "/api/system/status") {
-    return sendJson(response, 200, { shuttingDown: runtime.isShuttingDown(), queue: runtime.queue.snapshot() });
+    return sendJson(response, 200, { shuttingDown: runtime.isShuttingDown(), queue: runtime.queue.snapshot(), snapshots: runtime.snapshots?.status?.() || null });
   }
   if (request.method === "POST" && pathname === "/api/system/shutdown") {
     if (!runtime.onShutdown) return sendJson(response, 503, { error: "当前运行模式不支持远程优雅关闭" });
@@ -354,17 +368,18 @@ async function handleApi(request, response, pathname, store, runtime) {
         "scenario-3": { books: shelf.books, runs: shelf.runs.slice(0, 50) }
       },
       connection: getConnectionStatus(),
+      snapshots: runtime.snapshots?.status?.() || null,
       rules: { blankSource: "skip", zeroSource: "write" }
     });
   }
 
   if (request.method === "POST" && pathname === "/api/sources/import") {
-    return importSources(request, response, store);
+    return importSources(request, response, store, () => runtime.snapshots?.wake());
   }
 
   const scenarioImportMatch = pathname.match(/^\/api\/scenarios\/(scenario-1)\/sources\/import$/);
   if (request.method === "POST" && scenarioImportMatch) {
-    return importSources(request, response, store);
+    return importSources(request, response, store, () => runtime.snapshots?.wake());
   }
 
   if (request.method === "POST" && pathname === "/api/scenarios/scenario-2/pairs") {
@@ -376,7 +391,7 @@ async function handleApi(request, response, pathname, store, runtime) {
         if (duplicate) throw httpError(409, `工作簿已属于配对“${duplicate.name}”`);
         scope.pairs.push(pair);
         return { pair, pairs: scope.pairs };
-      }, store);
+      }, store, () => runtime.snapshots?.wake());
     } catch (error) {
       return sendJson(response, error.status || 400, { error: error.message });
     }
@@ -391,7 +406,7 @@ async function handleApi(request, response, pathname, store, runtime) {
         if (duplicate) throw httpError(409, `工作簿已配置为“${duplicate.name}”`);
         scope.books.push(book);
         return { book, books: scope.books };
-      }, store);
+      }, store, () => runtime.snapshots?.wake());
     } catch (error) {
       return sendJson(response, error.status || 400, { error: error.message });
     }
@@ -399,19 +414,19 @@ async function handleApi(request, response, pathname, store, runtime) {
 
   const entityRoute = matchEntityRoute(pathname);
   if (entityRoute && request.method === "PATCH") {
-    return patchEntity(request, response, entityRoute.definition, entityRoute.id, store);
+    return patchEntity(request, response, entityRoute.definition, entityRoute.id, store, () => runtime.snapshots?.wake());
   }
   if (entityRoute && request.method === "DELETE") {
-    return deleteEntity(response, entityRoute.definition, entityRoute.id, store);
+    return deleteEntity(response, entityRoute.definition, entityRoute.id, store, () => runtime.snapshots?.wake());
   }
 
   const scopedJobMatch = pathname.match(/^\/api\/scenarios\/(scenario-[123])\/jobs\/(preview|run)$/);
   const legacyJobMatch = pathname.match(/^\/api\/jobs\/(preview|run)$/);
   if (request.method === "POST" && scopedJobMatch) {
-    return runScenarioJob(request, response, scopedJobMatch[1], scopedJobMatch[2], store, runtime.queue, runtime.jobs);
+    return runScenarioJob(request, response, scopedJobMatch[1], scopedJobMatch[2], store, runtime.queue, runtime.jobs, runtime.snapshots);
   }
   if (request.method === "POST" && legacyJobMatch) {
-    return runScenarioJob(request, response, "scenario-1", legacyJobMatch[1], store, runtime.queue, runtime.jobs);
+    return runScenarioJob(request, response, "scenario-1", legacyJobMatch[1], store, runtime.queue, runtime.jobs, runtime.snapshots);
   }
 
   return sendJson(response, 404, { error: "接口不存在" });
@@ -479,8 +494,8 @@ async function serveStatic(request, response, pathname) {
   }
 }
 
-export function createDailyDataServer({ store = stateStore, queue = new JobQueue(), jobs = jobDefinitions, onShutdown = null, isShuttingDown = () => false } = {}) {
-  const runtime = { queue, jobs, onShutdown, isShuttingDown };
+export function createDailyDataServer({ store = stateStore, queue = new JobQueue(), jobs = jobDefinitions, snapshots = null, onShutdown = null, isShuttingDown = () => false } = {}) {
+  const runtime = { queue, jobs, snapshots, onShutdown, isShuttingDown };
   return createServer(async (request, response) => {
     try {
       const { pathname } = new URL(request.url, `http://${request.headers.host}`);
@@ -500,6 +515,11 @@ export function createDailyDataServer({ store = stateStore, queue = new JobQueue
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
   const queue = new JobQueue();
+  const snapshots = new SnapshotSynchronizer({
+    snapshots: new MaterializedSnapshotStore(new JsonStateStore(snapshotFile, { defaultState: { entries: {} } })),
+    stateStore,
+    definitions: jobDefinitions
+  });
   let shuttingDown = false;
   let shutdownPromise;
   let server;
@@ -516,7 +536,7 @@ if (isMain) {
         server.closeAllConnections?.();
         process.exit(1);
       }, 300_000);
-      await queue.onIdle();
+      await Promise.all([queue.onIdle(), snapshots.stop()]);
       server.closeIdleConnections?.();
       await closed;
       clearTimeout(timeout);
@@ -524,10 +544,11 @@ if (isMain) {
     })();
     return shutdownPromise;
   };
-  server = createDailyDataServer({ queue, onShutdown: gracefulShutdown, isShuttingDown: () => shuttingDown });
+  server = createDailyDataServer({ queue, snapshots, onShutdown: gracefulShutdown, isShuttingDown: () => shuttingDown });
   process.once("SIGINT", () => { void gracefulShutdown("SIGINT"); });
   process.once("SIGTERM", () => { void gracefulShutdown("SIGTERM"); });
   server.listen(port, host, () => {
     console.log(`Daily Data Hub 已启动：http://localhost:${port}`);
+    snapshots.start();
   });
 }
