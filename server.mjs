@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { collectWorkbook, executeWorkbook } from "./src/collector.mjs";
 import { collectScenario2Pair, executeScenario2Pair } from "./src/scenario2.mjs";
 import { collectShelfBook, executeShelfBook } from "./src/shelf-pack.mjs";
-import { clearWorkbookMetadataCache, getConnectionStatus } from "./src/google-sheets.mjs";
+import { clearWorkbookMetadataCache, getConnectionStatus, getSpreadsheetRevision } from "./src/google-sheets.mjs";
 import { JsonStateStore } from "./src/state-store.mjs";
 import { JobQueue } from "./src/job-queue.mjs";
 import { mapConcurrent } from "./src/async-utils.mjs";
@@ -232,6 +232,7 @@ const jobDefinitions = {
     emptyMessage: "没有已启用的工作簿",
     collect: collectWorkbook,
     execute: executeWorkbook,
+    spreadsheetIds: (source) => [source.spreadsheetId],
     failed: (source, error) => ({ sourceId: source.id, sourceName: source.name, status: "failed", error: error.message, rows: [] })
   },
   "scenario-2": {
@@ -240,6 +241,7 @@ const jobDefinitions = {
     emptyMessage: "没有已启用的日报配对",
     collect: collectScenario2Pair,
     execute: executeScenario2Pair,
+    spreadsheetIds: (pair) => [pair.client?.spreadsheetId, pair.own?.spreadsheetId],
     failed: (pair, error) => ({ pairId: pair.id, pairName: pair.name, sourceName: pair.client.name, targetName: pair.own.name, status: "failed", error: error.message, rows: [] })
   },
   "scenario-3": {
@@ -248,6 +250,7 @@ const jobDefinitions = {
     emptyMessage: "没有已启用的架上包工作簿",
     collect: collectShelfBook,
     execute: executeShelfBook,
+    spreadsheetIds: (book) => [book.spreadsheetId],
     failed: (book, error) => ({ sourceId: book.id, sourceName: book.name, status: "failed", error: error.message, rows: [] })
   }
 };
@@ -294,7 +297,7 @@ async function runScenarioJob(request, response, scenario, type, store, queue, d
   if (!selected.length) return sendJson(response, 400, { error: definition.emptyMessage });
   try {
     if (type === "preview" && snapshots) {
-      response.setHeader("x-data-source", "materialized-snapshot");
+      response.setHeader("x-data-source", "freshness-verified-preview");
       return sendJson(response, 200, await executeScenarioJob({ scenario, type, businessDate, selected, definition, store, snapshots }));
     }
     const queued = queue.enqueue(
@@ -518,7 +521,8 @@ if (isMain) {
   const snapshots = new SnapshotSynchronizer({
     snapshots: new MaterializedSnapshotStore(new JsonStateStore(snapshotFile, { defaultState: { entries: {} } })),
     stateStore,
-    definitions: jobDefinitions
+    definitions: jobDefinitions,
+    getSpreadsheetRevision
   });
   let shuttingDown = false;
   let shutdownPromise;

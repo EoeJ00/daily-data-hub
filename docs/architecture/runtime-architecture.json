@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "日报数据统计 · 高层运行时架构",
+    "locale": "zh-CN",
+    "output": "runtime-architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/EoeJ00/daily-data-hub",
+      "revision": "f41926dfe8baa4a42a1622d3f52ed4146fe4f6ce"
+    },
+    "viewBox": [1360, 680],
+    "views": [
+      {
+        "id": "preview-path",
+        "label": "预览归集",
+        "focus": ["operator", "webUi", "httpServer", "snapshotSync", "collectors", "sheetsGateway", "googleSheets", "snapshotStore"],
+        "note": "预览优先读取本地物化快照，缓存缺失或过期时由后台同步器刷新。"
+      },
+      {
+        "id": "write-path",
+        "label": "执行写入",
+        "focus": ["operator", "webUi", "httpServer", "jobQueue", "collectors", "sheetsGateway", "googleSheets", "snapshotSync"],
+        "note": "写入任务进入共享队列，实时复核 Google Sheets 后执行安全写入并刷新快照。"
+      },
+      {
+        "id": "local-state",
+        "label": "本地状态",
+        "focus": ["launcher", "httpServer", "stateStore", "snapshotSync", "snapshotStore"],
+        "note": "配置、运行日志与物化快照保存在本地 JSON 文件中。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "运营人员",
+      "sublabel": "桌面浏览器",
+      "pos": [20, 260],
+      "size": [110, 66]
+    },
+    {
+      "id": "webUi",
+      "type": "frontend",
+      "label": "MIULX Web UI",
+      "sublabel": "配置 / 预览 / 执行 / 日志",
+      "pos": [180, 260],
+      "size": [145, 66],
+      "sources": [
+        { "path": "public/app.js", "line": 1 },
+        { "path": "public/api.js", "line": 1 }
+      ]
+    },
+    {
+      "id": "launcher",
+      "type": "backend",
+      "label": "Windows 启动器",
+      "sublabel": "启动 / 优雅重启",
+      "pos": [390, 55],
+      "size": [155, 64],
+      "sources": [
+        { "path": "start-miulx-hidden.vbs", "line": 1, "label": "隐藏启动" },
+        { "path": "start-miulx.ps1", "line": 51, "label": "优雅重启" }
+      ]
+    },
+    {
+      "id": "httpServer",
+      "type": "backend",
+      "label": "Node.js HTTP 服务",
+      "sublabel": "静态资源 + REST API",
+      "pos": [390, 260],
+      "size": [155, 66],
+      "tag": "127.0.0.1:4173",
+      "sources": [
+        { "path": "server.mjs", "line": 228, "label": "任务定义" },
+        { "path": "server.mjs", "line": 286, "label": "请求调度" }
+      ]
+    },
+    {
+      "id": "jobQueue",
+      "type": "messagebus",
+      "label": "共享任务队列",
+      "sublabel": "写入串行化 / 断线续跑",
+      "pos": [650, 55],
+      "size": [170, 64],
+      "sources": [
+        { "path": "src/job-queue.mjs", "line": 1 }
+      ]
+    },
+    {
+      "id": "snapshotSync",
+      "type": "backend",
+      "label": "快照同步器",
+      "sublabel": "后台刷新 / 预览命中 / 写后失效",
+      "pos": [650, 420],
+      "size": [170, 66],
+      "sources": [
+        { "path": "src/materialized-snapshots.mjs", "line": 44 }
+      ]
+    },
+    {
+      "id": "collectors",
+      "type": "backend",
+      "label": "归集与写入引擎",
+      "sublabel": "单表 / 多表匹配 / 架上包",
+      "pos": [650, 260],
+      "size": [170, 72],
+      "sources": [
+        { "path": "src/collector.mjs", "line": 110, "label": "单表" },
+        { "path": "src/scenario2.mjs", "line": 675, "label": "多表匹配" },
+        { "path": "src/shelf-pack.mjs", "line": 298, "label": "架上包" }
+      ]
+    },
+    {
+      "id": "sheetsGateway",
+      "type": "backend",
+      "label": "Google Sheets 网关",
+      "sublabel": "限速 / 重试 / 批量读写",
+      "pos": [920, 260],
+      "size": [160, 68],
+      "tag": "全局 1200ms",
+      "sources": [
+        { "path": "src/google-sheets.mjs", "line": 1 }
+      ]
+    },
+    {
+      "id": "googleSheets",
+      "type": "external",
+      "label": "Google Sheets API",
+      "sublabel": "工作簿元数据与单元格",
+      "pos": [1180, 260],
+      "size": [160, 68]
+    },
+    {
+      "id": "stateStore",
+      "type": "database",
+      "label": "运行状态库",
+      "sublabel": "data/state.json",
+      "pos": [387.5, 570],
+      "size": [160, 62],
+      "sources": [
+        { "path": "src/state-store.mjs", "line": 1 }
+      ]
+    },
+    {
+      "id": "snapshotStore",
+      "type": "database",
+      "label": "物化快照库",
+      "sublabel": "data/snapshots.json",
+      "pos": [650, 570],
+      "size": [170, 62],
+      "sources": [
+        { "path": "src/materialized-snapshots.mjs", "line": 1 }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "本机运行时 · Node.js + 本地 JSON",
+      "wraps": ["launcher", "httpServer", "jobQueue", "snapshotSync", "collectors", "sheetsGateway", "stateStore", "snapshotStore"],
+      "pad": 24
+    }
+  ],
+  "connections": [
+    { "id": "operator-ui", "from": "operator", "to": "webUi", "label": "操作", "variant": "emphasis" },
+    { "id": "ui-api", "from": "webUi", "to": "httpServer", "label": "HTTP / JSON", "variant": "emphasis", "labelAt": [357, 238] },
+    { "id": "launcher-server", "from": "launcher", "to": "httpServer", "label": "启动与优雅重启", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "labelAt": [420, 155] },
+    { "id": "server-queue", "from": "httpServer", "to": "jobQueue", "label": "提交写入任务" },
+    { "id": "queue-collectors", "from": "jobQueue", "to": "collectors", "label": "实时归集与写入", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "labelAt": [850, 175] },
+    { "id": "server-snapshots", "from": "httpServer", "to": "snapshotSync", "label": "预览与失效" },
+    { "id": "snapshots-collectors", "from": "snapshotSync", "to": "collectors", "label": "后台刷新", "variant": "dashed", "fromSide": "top", "toSide": "bottom", "labelAt": [850, 375] },
+    { "id": "collectors-gateway", "from": "collectors", "to": "sheetsGateway", "label": "批量读取 / 安全写入" },
+    { "id": "gateway-google", "from": "sheetsGateway", "to": "googleSheets", "label": "Sheets API HTTPS", "variant": "emphasis" },
+    { "id": "server-state", "from": "httpServer", "to": "stateStore", "label": "配置与运行日志", "fromSide": "bottom", "toSide": "top", "labelAt": [375, 430] },
+    { "id": "snapshots-state", "from": "snapshotSync", "to": "stateStore", "label": "读取启用配置", "variant": "dashed" },
+    { "id": "snapshots-store", "from": "snapshotSync", "to": "snapshotStore", "label": "持久化日期快照", "fromSide": "bottom", "toSide": "top", "labelAt": [850, 525] }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "预览路径",
+      "items": ["优先返回本地物化快照", "缓存缺失或过期时后台刷新", "预览不进入写入任务队列"]
+    },
+    {
+      "dot": "emerald",
+      "title": "写入路径",
+      "items": ["共享队列避免并发写入冲突", "写入前读取 Google Sheets 实时状态", "成功后失效并刷新对应快照"]
+    },
+    {
+      "dot": "amber",
+      "title": "外部约束",
+      "items": ["Sheets 请求经过全局限速器", "瞬时错误与配额响应按策略退避重试", "服务退出前等待任务队列排空"]
+    }
+  ]
+}

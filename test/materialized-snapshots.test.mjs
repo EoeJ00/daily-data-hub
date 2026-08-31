@@ -24,43 +24,109 @@ test("materialized snapshots persist by scenario, item, date, and configuration"
   assert.equal(await snapshots.get("scenario-1", item, "2026-08-27"), null);
 });
 
-test("preview reads the local snapshot after one live fallback and writes force a refresh", async (context) => {
+test("preview verifies an unchanged workbook and refreshes after its version changes", async (context) => {
   const snapshots = await fixture(context);
-  const item = { id: "book", name: "日报", enabled: true };
+  const item = { id: "book", name: "日报", spreadsheetId: "sheet-1", enabled: true };
   let reads = 0;
+  let version = "1";
   const collect = async () => ({ status: "success", rows: [{ sourceValue: ++reads }] });
-  const sync = new SnapshotSynchronizer({ snapshots, staleMs: 60_000, logger: { warn() {} } });
+  const sync = new SnapshotSynchronizer({
+    snapshots,
+    definitions: { "scenario-1": { spreadsheetIds: (value) => [value.spreadsheetId] } },
+    getSpreadsheetRevision: async () => ({ version }),
+    logger: { warn() {} }
+  });
 
   const first = await sync.preview("scenario-1", item, "2026-08-27", collect);
   const second = await sync.preview("scenario-1", item, "2026-08-27", collect);
   assert.equal(first.snapshot.mode, "live-fallback");
-  assert.equal(second.snapshot.mode, "materialized");
+  assert.equal(second.snapshot.mode, "verified");
   assert.equal(second.rows[0].sourceValue, 1);
   assert.equal(reads, 1);
 
-  await sync.refreshAfterWrite("scenario-1", item, "2026-08-27", collect);
-  const afterWrite = await sync.preview("scenario-1", item, "2026-08-27", collect);
-  assert.equal(afterWrite.rows[0].sourceValue, 2);
+  version = "2";
+  const refreshed = await sync.preview("scenario-1", item, "2026-08-27", collect);
+  assert.equal(refreshed.snapshot.mode, "refreshed");
+  assert.equal(refreshed.rows[0].sourceValue, 2);
   assert.equal(reads, 2);
 });
 
-test("an existing run is returned immediately while its snapshot refreshes", async (context) => {
+test("a historical preview is synchronously replaced with current live data", async (context) => {
   const snapshots = await fixture(context);
-  const item = { id: "book", name: "日报", enabled: true };
+  const item = { id: "book", name: "日报", spreadsheetId: "sheet-1", enabled: true };
   const stateStore = { read: async () => ({ scenarios: { "scenario-1": { runs: [{
     type: "preview",
     businessDate: "2026-08-27",
     createdAt: "2026-08-27T12:00:00.000Z",
     results: [{ sourceId: item.id, status: "success", rows: [{ sourceValue: 7 }] }]
   }] } } }) };
-  let release;
-  const collect = () => new Promise((resolve) => { release = () => resolve({ status: "success", rows: [{ sourceValue: 8 }] }); });
-  const sync = new SnapshotSynchronizer({ snapshots, stateStore, logger: { warn() {} } });
+  const collect = async () => ({ status: "success", rows: [{ sourceValue: 8 }] });
+  const sync = new SnapshotSynchronizer({
+    snapshots,
+    stateStore,
+    definitions: { "scenario-1": { spreadsheetIds: (value) => [value.spreadsheetId] } },
+    getSpreadsheetRevision: async () => ({ version: "1" }),
+    logger: { warn() {} }
+  });
 
   const preview = await sync.preview("scenario-1", item, "2026-08-27", collect);
-  assert.equal(preview.snapshot.mode, "historical");
+  assert.equal(preview.snapshot.mode, "refreshed");
+  assert.equal(preview.rows[0].sourceValue, 8);
+});
+
+test("preview falls back to a live read when revision verification is unavailable", async (context) => {
+  const snapshots = await fixture(context);
+  const item = { id: "book", name: "日报", spreadsheetId: "sheet-1", enabled: true };
+  let reads = 0;
+  const sync = new SnapshotSynchronizer({
+    snapshots,
+    definitions: { "scenario-1": { spreadsheetIds: (value) => [value.spreadsheetId] } },
+    getSpreadsheetRevision: async () => { throw new Error("Drive unavailable"); },
+    logger: { warn() {} }
+  });
+
+  const preview = await sync.preview("scenario-1", item, "2026-08-27", async () => ({ status: "success", rows: [{ sourceValue: ++reads }] }));
+  assert.equal(preview.snapshot.mode, "live-fallback");
+  assert.match(preview.snapshot.warning, /直接读取实时数据/);
+  assert.equal(reads, 1);
+});
+
+test("refresh recollects once when the workbook changes during collection", async (context) => {
+  const snapshots = await fixture(context);
+  const item = { id: "book", name: "日报", spreadsheetId: "sheet-1", enabled: true };
+  let version = "1";
+  let reads = 0;
+  const sync = new SnapshotSynchronizer({
+    snapshots,
+    definitions: { "scenario-1": { spreadsheetIds: (value) => [value.spreadsheetId] } },
+    getSpreadsheetRevision: async () => ({ version }),
+    logger: { warn() {} }
+  });
+
+  const preview = await sync.preview("scenario-1", item, "2026-08-27", async () => {
+    reads += 1;
+    if (reads === 1) version = "2";
+    return { status: "success", rows: [{ sourceValue: reads }] };
+  });
+
+  assert.equal(reads, 2);
+  assert.equal(preview.rows[0].sourceValue, 2);
+  assert.deepEqual((await snapshots.get("scenario-1", item, "2026-08-27")).revisions, { "sheet-1": "2" });
+});
+
+test("preview labels cached data unverified when both verification and live read fail", async (context) => {
+  const snapshots = await fixture(context);
+  const item = { id: "book", name: "日报", spreadsheetId: "sheet-1", enabled: true };
+  await snapshots.put("scenario-1", item, "2026-08-27", { status: "success", rows: [{ sourceValue: 7 }] }, { "sheet-1": "1" });
+  const sync = new SnapshotSynchronizer({
+    snapshots,
+    definitions: { "scenario-1": { spreadsheetIds: (value) => [value.spreadsheetId] } },
+    getSpreadsheetRevision: async () => { throw new Error("Drive unavailable"); },
+    logger: { warn() {} }
+  });
+
+  const preview = await sync.preview("scenario-1", item, "2026-08-27", async () => { throw new Error("Sheets unavailable"); });
+  assert.equal(preview.snapshot.mode, "stale-unverified");
   assert.equal(preview.rows[0].sourceValue, 7);
-  while (!release) await new Promise((resolve) => setImmediate(resolve));
-  release();
-  await sync.stop();
+  assert.match(preview.snapshot.warning, /未经验证/);
 });

@@ -1,5 +1,5 @@
 import { batchWrite, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
-import { dateKey, isEmpty as empty, mergeProjectedColumns, normalizeText as normalized, parseNumber, sheetColumnRange, sheetHeaderRange, sheetRange } from "./spreadsheet-utils.mjs";
+import { dateKey, isEmpty as empty, mergeProjectedColumns, normalizeText as normalized, parseNumber, planSequentialDateRows, sheetColumnRange, sheetHeaderRange, sheetRange } from "./spreadsheet-utils.mjs";
 
 function channelColumnName(channel) {
   const displayName = String(channel ?? "").trim();
@@ -71,12 +71,13 @@ function locateMetricColumn(values, target, channel, metric) {
   return -1;
 }
 
-function mapRows(rows, targetValues, target, targetSheet) {
+function mapRows(rows, targetValues, target, datePlan, targetSheet, businessDate) {
   const metricColumnCache = new Map();
   return rows.map((row) => {
     if (row.status !== "pending") return row;
     const targetChannel = channelColumnName(row.channel);
-    if (!target || target.dateRow < 0) return { ...row, targetChannel, status: "error", message: "总表缺少目标日期行" };
+    if (!target) return { ...row, targetChannel, status: "error", message: "总表未找到日期表头" };
+    if (datePlan.error) return { ...row, targetChannel, status: "error", message: datePlan.error };
     const cacheKey = `${normalized(targetChannel)}\u0000${row.metric}`;
     let column = metricColumnCache.get(cacheKey);
     if (column === undefined) {
@@ -84,12 +85,23 @@ function mapRows(rows, targetValues, target, targetSheet) {
       metricColumnCache.set(cacheKey, column);
     }
     if (column < 0) return { ...row, targetChannel, status: "error", message: `总表未找到渠道指标列（匹配键：${targetChannel}）` };
-    const targetValue = targetValues[target.dateRow]?.[column];
-    const range = sheetRange(targetSheet, target.dateRow, column);
-    if (empty(targetValue)) return { ...row, targetChannel, status: "ready", targetValue: null, range };
+    const targetValue = targetValues[datePlan.row]?.[column];
+    const range = sheetRange(targetSheet, datePlan.row, column);
+    const dateState = {
+      dateUpdates: datePlan.updates,
+      message: datePlan.updates.length ? `将自动补充 ${datePlan.updates.length} 个日期行至 ${businessDate}` : undefined
+    };
+    if (empty(targetValue)) return {
+      ...row,
+      targetChannel,
+      status: "ready",
+      targetValue: null,
+      range,
+      ...dateState
+    };
     const parsed = parseNumber(targetValue);
-    if (parsed.kind === "number" && parsed.value === row.sourceValue) return { ...row, targetChannel, status: "same", targetValue: parsed.value, range, message: "目标值已一致" };
-    return { ...row, targetChannel, status: "conflict", targetValue, range, message: "目标已有不同数值，安全模式不覆盖" };
+    if (parsed.kind === "number" && parsed.value === row.sourceValue) return { ...row, targetChannel, status: "same", targetValue: parsed.value, range, ...dateState, message: dateState.message || "目标值已一致" };
+    return { ...row, targetChannel, status: "conflict", targetValue, range, ...dateState, message: dateState.message ? `${dateState.message}；目标已有不同数值，安全模式不覆盖` : "目标已有不同数值，安全模式不覆盖" };
   });
 }
 
@@ -129,6 +141,9 @@ export async function collectWorkbook(source, businessDate, deps = defaultDeps) 
   }));
   const targetValues = valuesByTitle.get(source.targetSheet) || [];
   const target = locateTarget(targetValues, businessDate);
+  const datePlan = target
+    ? planSequentialDateRows(targetValues, { row: target.headerRow, date: target.dateColumn }, businessDate, source.targetSheet)
+    : null;
   const channelValues = channels.map((channel) => ({ channel, values: valuesByTitle.get(channel) || [] }));
   const rows = channelValues.flatMap(({ channel, values }) => extractChannel(values, source, channel, businessDate));
   return {
@@ -138,12 +153,19 @@ export async function collectWorkbook(source, businessDate, deps = defaultDeps) 
     status: "success",
     businessDate,
     channelCount: channels.length,
-    rows: mapRows(rows, targetValues, target, source.targetSheet)
+    rows: mapRows(rows, targetValues, target, datePlan, source.targetSheet, businessDate)
   };
 }
 
 export async function executeWorkbook(source, businessDate, deps = defaultDeps) {
-  const preview = await collectWorkbook(source, businessDate, deps);
+  let preview = await collectWorkbook(source, businessDate, deps);
+  const dateUpdates = [...new Map(preview.rows
+    .flatMap((row) => row.dateUpdates || [])
+    .map((update) => [update.range, update])).values()];
+  if (dateUpdates.length) {
+    await deps.batchWrite(source.spreadsheetId, dateUpdates);
+    preview = await collectWorkbook(source, businessDate, deps);
+  }
   const ready = preview.rows.filter((row) => row.status === "ready");
   await deps.batchWrite(source.spreadsheetId, ready.map((row) => ({ range: row.range, value: row.sourceValue })));
   return {

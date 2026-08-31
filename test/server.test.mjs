@@ -288,7 +288,7 @@ test("previews use materialized snapshots while runs keep the live execution pat
 
   const previewResponse = await request("preview");
   assert.equal(previewResponse.status, 200);
-  assert.equal(previewResponse.headers.get("x-data-source"), "materialized-snapshot");
+  assert.equal(previewResponse.headers.get("x-data-source"), "freshness-verified-preview");
   releaseBlocker();
   await blocker.promise;
   assert.equal((await request("run")).status, 200);

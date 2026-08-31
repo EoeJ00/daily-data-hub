@@ -136,7 +136,7 @@ async function requestAccessToken() {
   const header = base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
   const claim = base64url(JSON.stringify({
     iss: account.client_email,
-    scope: "https://www.googleapis.com/auth/spreadsheets",
+    scope: "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.metadata.readonly",
     aud: "https://oauth2.googleapis.com/token",
     iat: now,
     exp: now + 3600
@@ -163,22 +163,33 @@ async function accessToken() {
   return tokenRequest;
 }
 
-async function googleRequest(path, options = {}) {
-  const url = `https://sheets.googleapis.com/v4/${path}`;
+async function authorizedGoogleRequest(url, label, options = {}) {
   const method = String(options.method || "GET").toUpperCase();
   const requestOptions = {
     ...options,
     headers: { authorization: `Bearer ${await accessToken()}`, "content-type": "application/json", ...options.headers }
   };
-  const request = () => fetchJson(url, requestOptions, "Google Sheets 接口", { attempts: method === "GET" ? READ_ATTEMPTS : 1 });
+  const request = () => fetchJson(url, requestOptions, label, { attempts: method === "GET" ? READ_ATTEMPTS : 1 });
   const { response, data } = method === "GET" ? await scheduleReadRequest(request) : await request();
   if (!response.ok) {
     const quotaMessage = response.status === 429
-      ? `Google Sheets 读取配额暂时耗尽，系统已自动限速并退避重试，请稍后再次执行${data.error?.message ? `（${data.error.message}）` : ""}`
+      ? `Google 读取配额暂时耗尽，系统已自动限速并退避重试，请稍后再次执行${data.error?.message ? `（${data.error.message}）` : ""}`
       : "";
-    throw new Error(quotaMessage || data.error?.message || `Google Sheets 请求失败：${response.status}`);
+    throw new Error(quotaMessage || data.error?.message || `${label}请求失败：${response.status}`);
   }
   return data;
+}
+
+function googleRequest(path, options = {}) {
+  return authorizedGoogleRequest(`https://sheets.googleapis.com/v4/${path}`, "Google Sheets 接口", options);
+}
+
+export async function getSpreadsheetRevision(spreadsheetId) {
+  const fields = encodeURIComponent("id,version,modifiedTime");
+  return authorizedGoogleRequest(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(spreadsheetId)}?fields=${fields}&supportsAllDrives=true`,
+    "Google Drive 版本接口"
+  );
 }
 
 export async function getWorkbook(spreadsheetId) {

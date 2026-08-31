@@ -556,6 +556,9 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
   }, { valueRenderOption: "FORMATTED_VALUE" });
   const totalValues = targetValues.get(totalSheet.title) || [];
   const totalTarget = locateTotal(totalValues, businessDate);
+  const totalDatePlan = totalTarget
+    ? planSequentialDateRows(totalValues, { row: totalTarget.headerRow, date: totalTarget.dateColumn }, businessDate, totalSheet.title)
+    : null;
   const detailCache = targetValues;
   const detailMetaCache = new Map();
   const totalColumnCache = new Map();
@@ -608,8 +611,10 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
       message: detailDatePlan.updates.length ? `将自动补充 ${detailDatePlan.updates.length} 个日期行至 ${businessDate}` : undefined
     };
     let total;
-    if (!totalTarget || totalTarget.dateRow < 0) {
-      total = { status: "error", range: "", value: null, message: `总表缺少 ${businessDate} 日期行` };
+    if (!totalTarget) {
+      total = { status: "error", range: "", value: null, message: "总表未找到日期表头" };
+    } else if (totalDatePlan.error) {
+      total = { status: "error", range: "", value: null, message: totalDatePlan.error };
     } else {
       const totalKey = `${match.descriptor.route.fullChain || match.descriptor.route.code}\u0000${row.metric}`;
       let totalColumn = totalColumnCache.get(totalKey);
@@ -621,7 +626,11 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
         ? { status: "error", range: "", value: null, message: `总表渠道 ${match.descriptor.route.base} 的${row.metric}列不唯一` }
         : totalColumn < 0
           ? { status: "error", range: "", value: null, message: `总表未找到渠道 ${match.descriptor.route.base} 的${row.metric}列` }
-          : inspectTarget(totalValues[totalTarget.dateRow]?.[totalColumn], row.sourceValue, sheetRange(totalSheet.title, totalTarget.dateRow, totalColumn));
+          : {
+              ...inspectTarget(totalValues[totalDatePlan.row]?.[totalColumn], row.sourceValue, sheetRange(totalSheet.title, totalDatePlan.row, totalColumn)),
+              dateUpdates: totalDatePlan.updates,
+              message: totalDatePlan.updates.length ? `将自动补充 ${totalDatePlan.updates.length} 个日期行至 ${businessDate}` : undefined
+            };
     }
     const status = combineStatus(detail, total);
     const notes = [];
@@ -705,14 +714,17 @@ export async function collectScenario2Pair(pair, businessDate, deps = defaultDep
 
 export async function executeScenario2Pair(pair, businessDate, deps = defaultDeps) {
   const runDeps = withWorkbookCache(deps);
-  const preview = await collectScenario2Pair(pair, businessDate, runDeps);
+  let preview = await collectScenario2Pair(pair, businessDate, runDeps);
+  const dateUpdates = [...new Map(preview.rows
+    .flatMap((row) => [...(row.detail?.dateUpdates || []), ...(row.total?.dateUpdates || [])])
+    .map((update) => [update.range, update])).values()];
+  if (dateUpdates.length) {
+    await runDeps.batchWrite(pair.own.spreadsheetId, dateUpdates);
+    preview = await collectScenario2Pair(pair, businessDate, runDeps);
+  }
   const readyDetails = preview.rows
     .filter((row) => row.status === "ready" && row.detail?.status === "ready" && row.total?.status !== "conflict" && row.total?.status !== "error");
-  const dateUpdates = [...new Map(readyDetails.flatMap((row) => row.detail.dateUpdates || []).map((update) => [update.range, update])).values()];
-  const detailUpdates = [
-    ...dateUpdates,
-    ...readyDetails.map((row) => ({ range: row.detail.range, value: row.sourceValue }))
-  ];
+  const detailUpdates = readyDetails.map((row) => ({ range: row.detail.range, value: row.sourceValue }));
   await runDeps.batchWrite(pair.own.spreadsheetId, detailUpdates);
 
   const afterDetail = await collectScenario2Pair(pair, businessDate, runDeps);

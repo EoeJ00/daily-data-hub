@@ -242,6 +242,21 @@ function notify(message, type = "info") {
   window.setTimeout(() => { alertRegion.innerHTML = ""; }, 6000);
 }
 
+function runFreshness(run) {
+  if (run?.type !== "preview") return null;
+  const modes = new Set((run.results || []).map((result) => result.snapshot?.mode).filter(Boolean));
+  if (modes.has("stale-unverified")) return { mode: "stale-unverified", label: "数据未验证", className: "error" };
+  if (modes.has("refreshed")) return { mode: "refreshed", label: "已更新实时数据", className: "" };
+  if (modes.has("live-fallback")) return { mode: "live-fallback", label: "实时读取", className: "warning" };
+  if (modes.has("verified")) return { mode: "verified", label: "快照已校验", className: "neutral" };
+  return null;
+}
+
+function runFreshnessBadge(run) {
+  const freshness = runFreshness(run);
+  return freshness ? `<span class="badge ${freshness.className}">${freshness.label}</span>` : "";
+}
+
 function setLoading(button, loading) {
   button.disabled = loading;
   button.classList.toggle("loading", loading);
@@ -294,7 +309,7 @@ function renderOverview() {
     </div>
     ${!state.connection.configured ? `<div class="alert">${icons.info}<p>${escapeHtml(state.connection.message)}。先完成链接导入；需要实际预览时再配置凭据。</p></div>` : ""}
     <section class="panel">
-      <div class="panel-header"><div><h2>最近一次处理结果</h2><p>${latest ? `${latest.businessDate} · ${latest.type === "run" ? "正式写入" : "预览"}` : "尚未执行任务"}</p></div>${latest ? `<span class="badge neutral">${new Date(latest.createdAt).toLocaleString("zh-CN")}</span>` : ""}</div>
+      <div class="panel-header"><div><h2>最近一次处理结果</h2><p>${latest ? `${latest.businessDate} · ${latest.type === "run" ? "正式写入" : "预览"}` : "尚未执行任务"}</p></div>${latest ? `<div class="actions">${runFreshnessBadge(latest)}<span class="badge neutral">${new Date(latest.createdAt).toLocaleString("zh-CN")}</span></div>` : ""}</div>
       ${latest ? renderRunDetails(latest) : `<div class="empty-state">${icons.sheet}<h3>等待首次预览</h3><p>导入工作簿后选择业务日期，先运行预览核对渠道映射和空值跳过结果。</p></div>`}
     </section>
     <section class="panel safety-rules-panel" hidden>
@@ -658,7 +673,7 @@ function renderScenario2Overview() {
       ${metric("冲突与异常", (summary.conflicts || 0) + (summary.errors || 0), "歧义、缺日期和已有值均不覆盖")}
     </div>
     <section class="panel">
-      <div class="panel-header"><div><h2>最近一次多表匹配处理结果</h2><p>${latest ? `${latest.businessDate} · ${latest.type === "run" ? "正式写入" : "预览"}` : "尚未执行任务"}</p></div>${latest ? `<span class="badge neutral">${new Date(latest.createdAt).toLocaleString("zh-CN")}</span>` : ""}</div>
+      <div class="panel-header"><div><h2>最近一次多表匹配处理结果</h2><p>${latest ? `${latest.businessDate} · ${latest.type === "run" ? "正式写入" : "预览"}` : "尚未执行任务"}</p></div>${latest ? `<div class="actions">${runFreshnessBadge(latest)}<span class="badge neutral">${new Date(latest.createdAt).toLocaleString("zh-CN")}</span></div>` : ""}</div>
       ${latest ? renderScenario2RunDetails(latest) : `<div class="empty-state">${icons.sheet}<h3>等待首次预览</h3><p>选择业务日期后先预览，核对渠道编号、投手页签、日期行以及两级目标单元格。</p></div>`}
     </section>
     <section class="panel safety-rules-panel" hidden>
@@ -707,7 +722,7 @@ function renderScenario3Overview() {
       ${metric("异常", summary.errors || 0, "未识别表格、投手页签或日期时保留记录")}
     </div>
     <section class="panel">
-      <div class="panel-header"><div><h2>最近一次架上包搬运结果</h2><p>${latest ? `${latest.businessDate} · ${latest.type === "run" ? "正式写入" : "预览"}` : "尚未执行任务"}</p></div>${latest ? `<span class="badge neutral">${new Date(latest.createdAt).toLocaleString("zh-CN")}</span>` : ""}</div>
+      <div class="panel-header"><div><h2>最近一次架上包搬运结果</h2><p>${latest ? `${latest.businessDate} · ${latest.type === "run" ? "正式写入" : "预览"}` : "尚未执行任务"}</p></div>${latest ? `<div class="actions">${runFreshnessBadge(latest)}<span class="badge neutral">${new Date(latest.createdAt).toLocaleString("zh-CN")}</span></div>` : ""}</div>
       ${latest ? renderShelfRunDetails(latest) : `<div class="empty-state">${icons.sheet}<h3>等待首次预览</h3><p>系统会自动识别架上包记录表、投手消耗表和总表，再按投手汇总消耗与回流消耗。</p></div>`}
     </section>`;
   bindRunDetailRows("scenario-3", shelf.runs);
@@ -952,7 +967,15 @@ async function runJob(type, triggerButton = null) {
     state.scenarios[scenario].runs.unshift(run);
     state.page = scenarioDefinitions[scenario].overviewPage;
     render();
-    notify(type === "run" ? `${scenarioDefinitions[scenario].jobLabel}正式写入任务已完成` : "预览已完成");
+    const freshness = runFreshness(run);
+    const previewMessage = freshness?.mode === "stale-unverified"
+      ? "预览完成，但实时校验失败，当前结果未经验证"
+      : freshness?.mode === "refreshed"
+        ? "检测到表格变化，已重新归集实时数据"
+        : freshness?.mode === "verified"
+          ? "预览已完成，快照已通过实时校验"
+          : "预览已完成，本次已实时读取数据";
+    notify(type === "run" ? `${scenarioDefinitions[scenario].jobLabel}正式写入任务已完成` : previewMessage, freshness?.mode === "stale-unverified" ? "error" : "info");
   } catch (error) { notify(error.message, "error"); }
   finally {
     setLoading(button, false);

@@ -283,7 +283,6 @@ test("appends missing shooter dates in sequence before multi-table writes", asyn
   const { pair, deps, values } = scenario2Fixture();
   const client = values.get("client:BI（日报总表）");
   client[2][0] = 46249;
-  values.get("own:总表")[1][0] = 46249;
 
   const preview = await collectScenario2Pair(pair, "2026-08-15", deps);
   assert.ok(preview.rows.every((row) => row.status === "ready"));
@@ -291,12 +290,25 @@ test("appends missing shooter dates in sequence before multi-table writes", asyn
     { range: "'34(ROY)'!A4", value: "2026-08-14" },
     { range: "'34(ROY)'!A5", value: "2026-08-15" }
   ]);
+  assert.deepEqual(preview.rows[0].total.dateUpdates, [
+    { range: "'总表'!A3", value: "2026-08-14" },
+    { range: "'总表'!A4", value: "2026-08-15" }
+  ]);
   assert.match(preview.rows[0].message, /自动补充 2 个日期行/);
 
-  const result = await executeScenario2Pair(pair, "2026-08-15", deps);
+  const batches = [];
+  const result = await executeScenario2Pair(pair, "2026-08-15", {
+    ...deps,
+    batchWrite: async (id, updates) => {
+      batches.push(updates.map((item) => item.range));
+      return deps.batchWrite(id, updates);
+    }
+  });
+  assert.ok(batches[0].every((range) => /!A\d+$/.test(range)));
   assert.ok(result.rows.every((row) => row.status === "written"));
   assert.deepEqual(values.get("own:34(ROY)").slice(3, 5).map((row) => row[0]), ["2026-08-14", "2026-08-15"]);
   assert.deepEqual(values.get("own:37(YC)").slice(3, 5).map((row) => row[0]), ["2026-08-14", "2026-08-15"]);
+  assert.deepEqual(values.get("own:总表").slice(2, 4).map((row) => row[0]), ["2026-08-14", "2026-08-15"]);
 });
 
 test("ignores hidden own and client chain sheets during matching", async () => {

@@ -119,7 +119,7 @@ test("appends missing shooter dates in sequence before writing metrics", async (
   const values = new Map([
     ["book:架上包 A", [["日期", "投手/包名", "服务费", "消耗", "回流消耗"], ["2026-08-15", "C", 0, 10, 1]]],
     ["book:C", [["日期", "渠道名", "服务费", "消耗", "回流消耗"], ["2026-08-13", "A", 0, null, null], [], []]],
-    ["book:总表", [["日期", "总消耗", "C", "C回流"], ["2026-08-15", null, null, null]]]
+    ["book:总表", [["日期", "总消耗", "C", "C回流"], ["2026-08-13", null, null, null], [], []]]
   ]);
   const location = (range) => {
     const [quotedTitle, cell] = range.split("!");
@@ -150,12 +150,18 @@ test("appends missing shooter dates in sequence before writing metrics", async (
     { range: "'C'!A3", value: "2026-08-14" },
     { range: "'C'!A4", value: "2026-08-15" }
   ]);
+  assert.deepEqual(preview.rows[0].total.dateUpdates, [
+    { range: "'总表'!A3", value: "2026-08-14" },
+    { range: "'总表'!A4", value: "2026-08-15" }
+  ]);
   assert.match(preview.rows[0].message, /自动补充 2 个日期行/);
 
   const writes = [];
+  const batches = [];
   const executed = await executeShelfBook({ id: "book-id", name: "架上包数据表", spreadsheetId: "book" }, "2026-08-15", {
     ...deps,
     batchWrite: async (_id, updates) => {
+      batches.push(updates.map((item) => item.range));
       writes.push(...updates);
       for (const update of updates) {
         const target = location(update.range);
@@ -166,8 +172,10 @@ test("appends missing shooter dates in sequence before writing metrics", async (
     }
   });
 
-  assert.deepEqual(writes.map((item) => item.range).sort(), ["'C'!A3", "'C'!A4", "'C'!D4", "'C'!E4", "'总表'!C2", "'总表'!D2"]);
+  assert.ok(batches[0].every((range) => /!A\d+$/.test(range)));
+  assert.deepEqual(writes.map((item) => item.range).sort(), ["'C'!A3", "'C'!A4", "'C'!D4", "'C'!E4", "'总表'!A3", "'总表'!A4", "'总表'!C4", "'总表'!D4"]);
   assert.deepEqual(values.get("book:C").slice(2, 4).map((row) => row[0]), ["2026-08-14", "2026-08-15"]);
+  assert.deepEqual(values.get("book:总表").slice(2, 4).map((row) => row[0]), ["2026-08-14", "2026-08-15"]);
   assert.ok(executed.rows.every((row) => row.status === "written"));
 });
 

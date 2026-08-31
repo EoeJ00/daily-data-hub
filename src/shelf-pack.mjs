@@ -116,10 +116,6 @@ export function extractShelfPackRecords(values, sheetTitle, businessDate) {
   return { status: "success", sheetTitle, rows };
 }
 
-function locateDateRow(values, header, businessDate) {
-  return values.findIndex((row, index) => index > header.row && dateKey(row?.[header.date], businessDate) === businessDate);
-}
-
 function findTotalHeader(values) {
   for (let row = 0; row < Math.min(values.length, 24); row += 1) {
     const cells = values[row] || [];
@@ -198,6 +194,7 @@ export function aggregateShelfPackRows(results) {
 
 function mapShelfTargets(records, businessDate, targetSheets, totalSheet) {
   const totalHeader = findTotalHeader(totalSheet.values);
+  const totalDatePlan = totalHeader ? planSequentialDateRows(totalSheet.values, totalHeader, businessDate, totalSheet.title) : null;
   const rows = [];
   for (const record of records) {
     const match = matchTargetSheet(record.shooter, targetSheets);
@@ -240,18 +237,21 @@ function mapShelfTargets(records, businessDate, targetSheets, totalSheet) {
       let total;
       if (!totalHeader) {
         total = { status: "error", message: "总表未找到日期和总消耗表头" };
+      } else if (totalDatePlan.error) {
+        total = { status: "error", message: totalDatePlan.error };
       } else {
-        const totalDateRow = locateDateRow(totalSheet.values, totalHeader, businessDate);
-        if (totalDateRow < 0) {
-          total = { status: "error", message: `总表缺少 ${businessDate} 日期行` };
+        const located = locateTotalMetricColumn(totalSheet.values, totalHeader, record.shooter, metric);
+        if (located.error) {
+          total = { status: "error", message: located.error };
         } else {
-          const located = locateTotalMetricColumn(totalSheet.values, totalHeader, record.shooter, metric);
-          if (located.error) {
-            total = { status: "error", message: located.error };
-          } else {
-            const range = sheetRange(totalSheet.title, totalDateRow, located.column);
-            total = { ...inspectTarget(totalSheet.values[totalDateRow]?.[located.column], sourceValue, range), range };
-          }
+          const range = sheetRange(totalSheet.title, totalDatePlan.row, located.column);
+          const inspection = inspectTarget(totalSheet.values[totalDatePlan.row]?.[located.column], sourceValue, range);
+          total = {
+            ...inspection,
+            range,
+            dateUpdates: totalDatePlan.updates,
+            message: totalDatePlan.updates.length ? `将自动补充 ${totalDatePlan.updates.length} 个日期行至 ${businessDate}` : inspection.message
+          };
         }
       }
 
@@ -367,17 +367,20 @@ async function verifyShelfWrites(book, preview, updates, deps) {
 }
 
 export async function executeShelfBook(book, businessDate, deps = defaultDeps) {
-  const preview = await collectShelfBook(book, businessDate, deps);
-  const readyRows = preview.rows.filter((row) => row.status === "ready");
-  const dateUpdates = [...new Map(readyRows
-    .flatMap((row) => row.detail?.dateUpdates || [])
+  let preview = await collectShelfBook(book, businessDate, deps);
+  const dateUpdates = [...new Map(preview.rows
+    .flatMap((row) => [...(row.detail?.dateUpdates || []), ...(row.total?.dateUpdates || [])])
     .map((update) => [update.range, update])).values()];
+  if (dateUpdates.length) {
+    await deps.batchWrite(book.spreadsheetId, dateUpdates);
+    preview = await collectShelfBook(book, businessDate, deps);
+  }
+  const readyRows = preview.rows.filter((row) => row.status === "ready");
   const valueUpdates = readyRows.flatMap((row) => {
     return [row.detail, row.total]
       .filter((target) => target?.status === "ready" && target.range)
       .map((target) => ({ range: target.range, value: row.sourceValue }));
   });
-  const updates = [...dateUpdates, ...valueUpdates];
-  await deps.batchWrite(book.spreadsheetId, updates);
-  return updates.length ? verifyShelfWrites(book, preview, updates, deps) : preview;
+  await deps.batchWrite(book.spreadsheetId, valueUpdates);
+  return valueUpdates.length ? verifyShelfWrites(book, preview, valueUpdates, deps) : preview;
 }

@@ -53,7 +53,7 @@ node server.mjs
 
 ## Google 服务账号配置
 
-程序使用 Google Sheets API。创建 Google Cloud 服务账号、启用 Google Sheets API，并把需要处理的每个工作簿共享给服务账号邮箱。
+程序使用 Google Sheets API，并通过 Google Drive API 的文件版本号校验本地快照是否仍然有效。创建 Google Cloud 服务账号时需同时启用 Google Sheets API 和 Google Drive API，并把需要处理的每个工作簿共享给服务账号邮箱。若 Drive API 暂不可用，预览会自动改为实时读取，不会把未经校验的快照误报为正常数据。
 
 推荐用凭据文件启动：
 

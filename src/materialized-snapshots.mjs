@@ -16,7 +16,7 @@ export class MaterializedSnapshotStore {
     return entry?.fingerprint === fingerprint(item) ? clone(entry) : null;
   }
 
-  async put(scenario, item, businessDate, result) {
+  async put(scenario, item, businessDate, result, revisions = null) {
     const now = new Date().toISOString();
     const cutoff = Date.now() - this.retentionMs;
     return this.store.mutate((state) => {
@@ -24,9 +24,18 @@ export class MaterializedSnapshotStore {
       for (const [key, entry] of Object.entries(state.entries)) {
         if (Date.parse(entry.syncedAt) < cutoff) delete state.entries[key];
       }
-      const entry = { scenario, itemId: item.id, businessDate, fingerprint: fingerprint(item), syncedAt: now, result };
+      const entry = { scenario, itemId: item.id, businessDate, fingerprint: fingerprint(item), syncedAt: now, checkedAt: now, revisions, result };
       state.entries[snapshotKey(scenario, item.id, businessDate)] = entry;
       return entry;
+    });
+  }
+
+  async touch(scenario, itemId, businessDate) {
+    const key = snapshotKey(scenario, itemId, businessDate);
+    return this.store.mutate((state) => {
+      const entry = state.entries?.[key];
+      if (entry) entry.checkedAt = new Date().toISOString();
+      return entry || null;
     });
   }
 
@@ -46,15 +55,16 @@ export class SnapshotSynchronizer {
   #cycle;
   #stopped = true;
   #inFlight = new Map();
+  #revisionInFlight = new Map();
   #lastCycleAt = null;
   #lastError = null;
 
-  constructor({ snapshots, stateStore, definitions, intervalMs = 120_000, staleMs = 120_000, startupDelayMs = 1_000, logger = console } = {}) {
+  constructor({ snapshots, stateStore, definitions, getSpreadsheetRevision, intervalMs = 120_000, startupDelayMs = 1_000, logger = console } = {}) {
     this.snapshots = snapshots;
     this.stateStore = stateStore;
     this.definitions = definitions;
+    this.getSpreadsheetRevision = getSpreadsheetRevision;
     this.intervalMs = intervalMs;
-    this.staleMs = staleMs;
     this.startupDelayMs = startupDelayMs;
     this.logger = logger;
   }
@@ -83,26 +93,54 @@ export class SnapshotSynchronizer {
 
   async preview(scenario, item, businessDate, collect) {
     const cached = await this.snapshots.get(scenario, item, businessDate);
-    if (cached) {
-      const stale = Date.now() - Date.parse(cached.syncedAt) > this.staleMs;
-      if (stale) void this.refresh(scenario, item, businessDate, collect).catch((error) => this.#report(error));
-      return this.#decorate(cached.result, cached.syncedAt, stale ? "stale" : "materialized");
+    const historical = cached ? null : await this.#historicalResult(scenario, item.id, businessDate);
+    try {
+      const revisions = await this.#revisions(scenario, item);
+      if (cached?.revisions && this.#sameRevisions(cached.revisions, revisions)) {
+        const checked = await this.snapshots.touch(scenario, item.id, businessDate);
+        return this.#decorate(cached.result, cached.syncedAt, checked?.checkedAt, "verified");
+      }
+      const entry = await this.refresh(scenario, item, businessDate, collect, { revisions });
+      return this.#decorate(entry.result, entry.syncedAt, entry.checkedAt, cached || historical ? "refreshed" : "live-fallback");
+    } catch (verificationError) {
+      this.#report(verificationError);
+      try {
+        const entry = await this.refresh(scenario, item, businessDate, collect, { verify: false });
+        return this.#decorate(entry.result, entry.syncedAt, entry.checkedAt, "live-fallback", "版本校验暂不可用，本次已直接读取实时数据");
+      } catch (collectError) {
+        const fallback = cached || historical;
+        if (!fallback) throw collectError;
+        this.#report(collectError);
+        return this.#decorate(fallback.result, fallback.syncedAt, fallback.checkedAt, "stale-unverified", "实时校验与重新读取均失败，当前结果未经验证");
+      }
     }
-    const historical = await this.#historicalResult(scenario, item.id, businessDate);
-    if (historical) {
-      void this.refresh(scenario, item, businessDate, collect).catch((error) => this.#report(error));
-      return this.#decorate(historical.result, historical.syncedAt, "historical");
-    }
-    const entry = await this.refresh(scenario, item, businessDate, collect);
-    return this.#decorate(entry.result, entry.syncedAt, "live-fallback");
   }
 
-  async refresh(scenario, item, businessDate, collect) {
+  async refresh(scenario, item, businessDate, collect, { revisions, verify = true } = {}) {
     const key = snapshotKey(scenario, item.id, businessDate);
     if (!this.#inFlight.has(key)) {
       const request = Promise.resolve()
-        .then(() => collect(item, businessDate))
-        .then((result) => this.snapshots.put(scenario, item, businessDate, result))
+        .then(async () => {
+          const before = revisions === undefined && verify ? await this.#revisions(scenario, item) : revisions || null;
+          let result = await collect(item, businessDate);
+          let finalRevisions = before;
+          if (verify && before) {
+            try {
+              const after = await this.#revisions(scenario, item);
+              if (this.#sameRevisions(before, after)) {
+                finalRevisions = after;
+              } else {
+                result = await collect(item, businessDate);
+                const final = await this.#revisions(scenario, item);
+                finalRevisions = this.#sameRevisions(after, final) ? final : null;
+              }
+            } catch (error) {
+              this.#report(error);
+              finalRevisions = null;
+            }
+          }
+          return this.snapshots.put(scenario, item, businessDate, result, finalRevisions);
+        })
         .finally(() => this.#inFlight.delete(key));
       this.#inFlight.set(key, request);
     }
@@ -114,8 +152,29 @@ export class SnapshotSynchronizer {
     void this.refresh(scenario, item, businessDate, collect).catch((error) => this.#report(error));
   }
 
-  #decorate(result, syncedAt, mode) {
-    return { ...clone(result), snapshot: { mode, syncedAt } };
+  #decorate(result, syncedAt, checkedAt, mode, warning) {
+    return { ...clone(result), snapshot: { mode, syncedAt, checkedAt: checkedAt || syncedAt, ...(warning ? { warning } : {}) } };
+  }
+
+  async #revisions(scenario, item) {
+    const ids = [...new Set(this.definitions?.[scenario]?.spreadsheetIds?.(item) || [])].filter(Boolean).sort();
+    if (!ids.length || !this.getSpreadsheetRevision) return null;
+    const values = await Promise.all(ids.map(async (id) => [id, await this.#revision(id)]));
+    return Object.fromEntries(values.map(([id, value]) => [id, String(value.version || value.modifiedTime || "")]));
+  }
+
+  #revision(spreadsheetId) {
+    if (!this.#revisionInFlight.has(spreadsheetId)) {
+      const request = Promise.resolve()
+        .then(() => this.getSpreadsheetRevision(spreadsheetId))
+        .finally(() => this.#revisionInFlight.delete(spreadsheetId));
+      this.#revisionInFlight.set(spreadsheetId, request);
+    }
+    return this.#revisionInFlight.get(spreadsheetId);
+  }
+
+  #sameRevisions(left, right) {
+    return Boolean(left && right) && JSON.stringify(left) === JSON.stringify(right);
   }
 
   async #historicalResult(scenario, itemId, businessDate) {
@@ -150,7 +209,7 @@ export class SnapshotSynchronizer {
       for (const item of items.filter((candidate) => candidate.enabled)) {
         if (this.#stopped) return;
         try {
-          await this.refresh(scenario, item, businessDate, definition.collect);
+          await this.preview(scenario, item, businessDate, definition.collect);
         } catch (error) {
           this.#report(error);
         }

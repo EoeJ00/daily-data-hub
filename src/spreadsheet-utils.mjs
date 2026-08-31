@@ -81,8 +81,8 @@ export function planSequentialDateRows(values, header, businessDate, sheetTitle)
 
   const lastTime = Date.parse(`${last.date}T00:00:00Z`);
   const targetTime = Date.parse(`${businessDate}T00:00:00Z`);
-  if (!Number.isFinite(lastTime) || !Number.isFinite(targetTime)) return { error: `无法解析投手消耗表日期：${last.date} → ${businessDate}` };
-  if (targetTime <= lastTime) return { error: `投手消耗表缺少 ${businessDate} 日期行，且该日期早于表内最后日期 ${last.date}，无法向下追加` };
+  if (!Number.isFinite(lastTime) || !Number.isFinite(targetTime)) return { error: `无法解析 ${sheetTitle} 日期：${last.date} → ${businessDate}` };
+  if (targetTime <= lastTime) return { error: `${sheetTitle} 缺少 ${businessDate} 日期行，且该日期早于表内最后日期 ${last.date}，无法向下追加` };
 
   const dayCount = Math.round((targetTime - lastTime) / 86_400_000);
   const updates = Array.from({ length: dayCount }, (_, index) => {
