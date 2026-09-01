@@ -218,12 +218,15 @@ function findHeaders(values, businessDate) {
   return headers.sort((left, right) => left.row - right.row);
 }
 
-async function readProjectedClientValues(spreadsheetId, sheetTitle, businessDate, deps) {
+async function readProjectedClientValues(spreadsheetId, sheetTitle, businessDate, deps, mappingPlan) {
   const values = await readProjectedSheetMap(spreadsheetId, [sheetTitle], deps, (sample) => {
     const headers = findHeaders(sample, businessDate);
     if (!headers.length) return null;
-    return [...new Set(headers.flatMap(({ date, channel, spend, returnSpend }) => [date, channel, spend, returnSpend]).filter((column) => column >= 0))];
-  });
+    return {
+      columns: [...new Set(headers.flatMap(({ date, channel, spend, returnSpend }) => [date, channel, spend, returnSpend]).filter((column) => column >= 0))],
+      signatureRows: headers.map(({ row }) => row)
+    };
+  }, { mappingPlan });
   return values.get(sheetTitle) || [];
 }
 
@@ -418,7 +421,7 @@ function chooseClientChainSheet(clientSheets, descriptor) {
   return { sheet: matches[0].sheet, route: matches[0].route };
 }
 
-async function collectChainSheetRecords(pair, businessDate, clientSheets, ownDescriptors, deps) {
+async function collectChainSheetRecords(pair, businessDate, clientSheets, ownDescriptors, deps, clientWorkbook) {
   const matchCache = new Map();
   const getMatch = (descriptor) => {
     const key = descriptor.sheet.title;
@@ -433,7 +436,17 @@ async function collectChainSheetRecords(pair, businessDate, clientSheets, ownDes
   const clientValues = await readProjectedSheetMap(pair.client.spreadsheetId, matchedTitles, deps, (sample) => {
     const headers = findStandaloneHeaders(sample);
     if (!headers.length) return null;
-    return [...new Set(headers.flatMap(({ date, channel, spend, returnSpend }) => [date, channel, spend, returnSpend]).filter((column) => column >= 0))];
+    return {
+      columns: [...new Set(headers.flatMap(({ date, channel, spend, returnSpend }) => [date, channel, spend, returnSpend]).filter((column) => column >= 0))],
+      signatureRows: headers.map(({ row }) => row)
+    };
+  }, {
+    mappingPlan: {
+      store: deps.mappingPlans,
+      workbook: clientWorkbook,
+      configurationId: pair.id || pair.client.spreadsheetId,
+      configuration: { side: "client", mode: "chain", targetSheet: pair.targetSheet || "总表", clientGid: pair.client.gid },
+    }
   });
   const rows = [];
   for (const descriptor of ownDescriptors.details) {
@@ -495,27 +508,70 @@ function locateTotal(values, businessDate) {
 }
 
 async function readSheetMap(spreadsheetId, titles, deps, options = {}) {
+  const { mappingPlan: _mappingPlan, ...readOptions } = options;
   const uniqueTitles = [...new Set(titles)];
   if (deps.getSheetValuesBatch) {
     const ranges = uniqueTitles.map(quoteSheetTitle);
-    const values = await deps.getSheetValuesBatch(spreadsheetId, ranges, options);
+    const values = await deps.getSheetValuesBatch(spreadsheetId, ranges, readOptions);
     return new Map(uniqueTitles.map((title, index) => [title, values[index] || []]));
   }
   return new Map(await mapConcurrent(uniqueTitles, async (title) => [
     title,
-    await deps.getSheetValues(spreadsheetId, title, options)
+    await deps.getSheetValues(spreadsheetId, title, readOptions)
   ], 6));
 }
 
 async function readProjectedSheetMap(spreadsheetId, titles, deps, identifyColumns, options = {}) {
   const uniqueTitles = [...new Set(titles)];
-  if (!deps.getSheetValuesBatch) return readSheetMap(spreadsheetId, uniqueTitles, deps, options);
-  const samples = await deps.getSheetValuesBatch(spreadsheetId, uniqueTitles.map((title) => `${quoteSheetTitle(title)}!1:20`), options);
-  const specs = uniqueTitles.map((title, index) => ({ title, sample: samples[index] || [], columns: identifyColumns(samples[index] || [], title) }));
+  const { mappingPlan, ...readOptions } = options;
+  if (!deps.getSheetValuesBatch) return readSheetMap(spreadsheetId, uniqueTitles, deps, readOptions);
+  const samples = await deps.getSheetValuesBatch(spreadsheetId, uniqueTitles.map((title) => `${quoteSheetTitle(title)}!1:20`), readOptions);
+  const sampleByTitle = new Map(uniqueTitles.map((title, index) => [title, samples[index] || []]));
+  const planArgs = mappingPlan?.store && mappingPlan.workbook
+    ? {
+        scenario: "scenario-2",
+        configurationId: mappingPlan.configurationId || spreadsheetId,
+        workbookId: spreadsheetId,
+        configuration: { ...(mappingPlan.configuration || {}), scope: uniqueTitles },
+        workbook: mappingPlan.workbook,
+        samples: sampleByTitle
+      }
+    : null;
+  let cached = null;
+  if (planArgs) {
+    try {
+      cached = await mappingPlan.store.get(planArgs);
+    } catch {
+      cached = null;
+    }
+  }
+  const projections = cached?.mapping?.projections || {};
+  const specs = uniqueTitles.map((title, index) => {
+    const stored = Object.prototype.hasOwnProperty.call(projections, title) ? projections[title] : undefined;
+    if (stored === null || (Array.isArray(stored) && stored.every((column) => Number.isInteger(column) && column >= 0))) {
+      return { title, sample: samples[index] || [], columns: stored };
+    }
+    const identified = identifyColumns(samples[index] || [], title);
+    const normalized = Array.isArray(identified)
+      ? { columns: identified, signatureRows: [] }
+      : identified || { columns: null, signatureRows: [] };
+    return { title, sample: samples[index] || [], columns: normalized.columns, signatureRows: normalized.signatureRows || [] };
+  });
+  if (planArgs && (!cached || specs.some((spec) => !Object.prototype.hasOwnProperty.call(projections, spec.title)))) {
+    try {
+      await mappingPlan.store.put({
+        ...planArgs,
+        signatureRowsByTitle: new Map(specs.map((spec) => [spec.title, spec.signatureRows || []])),
+        mapping: { projections: Object.fromEntries(specs.map(({ title, columns }) => [title, columns])) }
+      });
+    } catch {
+      // A plan is an optimization; the live parser remains authoritative.
+    }
+  }
   const ranges = specs.flatMap(({ title, columns }) => columns === null
     ? [quoteSheetTitle(title)]
     : columns.map((column) => sheetColumnRange(title, column)));
-  const values = await deps.getSheetValuesBatch(spreadsheetId, ranges, options);
+  const values = await deps.getSheetValuesBatch(spreadsheetId, ranges, readOptions);
   let cursor = 0;
   return new Map(specs.map(({ title, sample, columns }) => {
     if (columns === null) return [title, values[cursor++] || []];
@@ -542,18 +598,41 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
   const targetValues = await readProjectedSheetMap(pair.own.spreadsheetId, [totalSheet.title, ...matchedSheets], deps, (sample, title) => {
     if (title === totalSheet.title) {
       const target = locateTotal(sample, businessDate);
-      if (!target) return [];
+      if (!target) return { columns: [], signatureRows: [] };
       const columns = new Set([target.dateColumn]);
       for (const row of sourceRows.filter((item) => item.status === "pending")) {
         const descriptor = getMatch(row).descriptor;
         const column = descriptor ? locateTotalColumn(sample, target, descriptor.route, row.metric) : -1;
         if (column >= 0) columns.add(column);
       }
-      return [...columns];
+      return {
+        columns: [...columns],
+        signatureRows: [target.headerRow - 1, target.headerRow].filter((row) => row >= 0)
+      };
     }
     const header = findDetailHeader(sample);
-    return header ? [...new Set([header.date, header.channel, header.spend, header.returnSpend].filter((column) => column >= 0))] : [];
-  }, { valueRenderOption: "FORMATTED_VALUE" });
+    return header
+      ? {
+          columns: [...new Set([header.date, header.channel, header.spend, header.returnSpend].filter((column) => column >= 0))],
+          signatureRows: [header.row]
+        }
+      : { columns: [], signatureRows: [] };
+  }, {
+    valueRenderOption: "FORMATTED_VALUE",
+    mappingPlan: {
+      store: deps.mappingPlans,
+      workbook: ownWorkbook,
+      configurationId: pair.id || pair.own.spreadsheetId,
+      configuration: {
+        side: "own",
+        targetSheet: pair.targetSheet || "总表",
+        clientGid: pair.client.gid,
+        sourceRoutes: [...new Set(sourceRows
+          .filter((item) => item.status === "pending")
+          .map((item) => `${item.routeChain || item.routeCode || item.channel}\u0000${item.shooter || ""}`))].sort()
+      }
+    }
+  });
   const totalValues = targetValues.get(totalSheet.title) || [];
   const totalTarget = locateTotal(totalValues, businessDate);
   const totalDatePlan = totalTarget
@@ -655,6 +734,18 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
 
 const defaultDeps = { getWorkbook, getSheetValues, getSheetValuesBatch, batchWrite };
 
+function withDefaults(deps) {
+  const provided = deps || {};
+  const result = {
+    ...provided,
+    getWorkbook: provided.getWorkbook || defaultDeps.getWorkbook,
+    getSheetValues: provided.getSheetValues || defaultDeps.getSheetValues,
+    batchWrite: provided.batchWrite || defaultDeps.batchWrite
+  };
+  if (provided.getSheetValuesBatch || !provided.getSheetValues) result.getSheetValuesBatch = provided.getSheetValuesBatch || defaultDeps.getSheetValuesBatch;
+  return result;
+}
+
 function withWorkbookCache(deps) {
   const cache = new Map();
   return {
@@ -673,20 +764,26 @@ function withWorkbookCache(deps) {
 }
 
 export async function collectScenario2Pair(pair, businessDate, deps = defaultDeps) {
+  const runDeps = withDefaults(deps);
   const [clientWorkbook, ownWorkbook] = await Promise.all([
-    deps.getWorkbook(pair.client.spreadsheetId),
-    deps.getWorkbook(pair.own.spreadsheetId)
+    runDeps.getWorkbook(pair.client.spreadsheetId),
+    runDeps.getWorkbook(pair.own.spreadsheetId)
   ]);
   const clientSheets = clientWorkbook.sheets
     .filter(({ properties }) => !properties.hidden)
     .map(({ properties }) => properties);
   if (!clientSheets.length) throw new Error("甲方日报表没有可读取的页签");
   const ownDescriptors = detailDescriptors(ownWorkbook, pair.targetSheet || "总表");
-  let sourceRows = await collectChainSheetRecords(pair, businessDate, clientSheets, ownDescriptors, deps);
+  let sourceRows = await collectChainSheetRecords(pair, businessDate, clientSheets, ownDescriptors, runDeps, clientWorkbook);
   let sourceSheet = "多链独立工作表";
   if (!sourceRows) {
     const selected = clientSheets.find((sheet) => String(sheet.sheetId) === String(pair.client.gid)) || clientSheets[0];
-    const clientValues = await readProjectedClientValues(pair.client.spreadsheetId, selected.title, businessDate, deps);
+    const clientValues = await readProjectedClientValues(pair.client.spreadsheetId, selected.title, businessDate, runDeps, {
+      store: runDeps.mappingPlans,
+      workbook: clientWorkbook,
+      configurationId: pair.id || pair.client.spreadsheetId,
+      configuration: { side: "client", mode: "single", targetSheet: pair.targetSheet || "总表", clientGid: pair.client.gid }
+    });
     sourceRows = extractClientRecords(clientValues, businessDate, selected.title);
     if (sourceRows.some((row) => row.metric === "结构" && row.status === "error")) {
       sourceRows = sourceRows.map((row) => row.metric === "结构" && row.status === "error"
@@ -698,7 +795,7 @@ export async function collectScenario2Pair(pair, businessDate, deps = defaultDep
     }
     sourceSheet = selected.title;
   }
-  const rows = await mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps);
+  const rows = await mapTargets(pair, businessDate, sourceRows, ownWorkbook, runDeps);
   return {
     pairId: pair.id,
     pairName: pair.name,
@@ -713,7 +810,7 @@ export async function collectScenario2Pair(pair, businessDate, deps = defaultDep
 }
 
 export async function executeScenario2Pair(pair, businessDate, deps = defaultDeps) {
-  const runDeps = withWorkbookCache(deps);
+  const runDeps = withWorkbookCache(withDefaults(deps));
   let preview = await collectScenario2Pair(pair, businessDate, runDeps);
   const dateUpdates = [...new Map(preview.rows
     .flatMap((row) => [...(row.detail?.dateUpdates || []), ...(row.total?.dateUpdates || [])])

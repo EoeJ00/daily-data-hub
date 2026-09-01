@@ -1,5 +1,6 @@
 data/state.json
 data/snapshots.json
+data/mapping-plans.json
 data/launcher.log
 .env
 node_modules/

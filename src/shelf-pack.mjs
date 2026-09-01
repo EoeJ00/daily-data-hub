@@ -321,6 +321,13 @@ function projectionColumns(sheet, targetSheets, sourceSheets) {
   return header ? totalProjectionColumns(sheet.sample, header, targetSheets, sourceSheets) : [];
 }
 
+function shelfSignatureRows(sheet) {
+  const header = sheet.kind === "rack" || sheet.kind === "shooter"
+    ? findHeader(sheet.sample, sheet.kind)
+    : compact(sheet.title) === "总表" ? findTotalHeader(sheet.sample) : null;
+  return header ? [header.row] : [];
+}
+
 function projectedColumnValues(values, column) {
   const rows = values || [];
   const fullRows = rows.some((row) => Array.isArray(row) && row.length > 1);
@@ -353,7 +360,7 @@ async function readProjectedSheets(spreadsheetId, specs, deps) {
   });
 }
 
-async function readShelfSheets(spreadsheetId, properties, deps) {
+async function readShelfSheets(spreadsheetId, properties, deps, mappingPlan) {
   const samples = deps.getSheetValuesBatch
     ? await deps.getSheetValuesBatch(spreadsheetId, properties.map((sheet) => sheetHeaderRange(sheet.title, shelfHeaderRows)))
     : await mapConcurrent(properties, (sheet) => deps.getSheetValues(spreadsheetId, sheet.title, { range: `1:${shelfHeaderRows}` }), 6);
@@ -371,15 +378,74 @@ async function readShelfSheets(spreadsheetId, properties, deps) {
     ...sheet,
     columns: projectionColumns(sheet, targetSheets, selectedRacks)
   }));
-  return readProjectedSheets(spreadsheetId, specs, deps);
+  const planArgs = mappingPlan?.store && mappingPlan.workbook
+    ? {
+        scenario: "scenario-3",
+        configurationId: mappingPlan.configurationId || spreadsheetId,
+        workbookId: spreadsheetId,
+        configuration: {
+          kind: "shelf-pack",
+          sourceShooters: [...new Set(selectedRacks.flatMap((sheet) => {
+            const header = findHeader(sheet.sample, "rack");
+            return header ? sheet.sample.slice(header.row + 1).flatMap((row) => shooterAliases(row?.[header.name])) : [];
+          }))].sort()
+        },
+        workbook: mappingPlan.workbook,
+        samples: new Map(sampled.map((sheet) => [sheet.title, sheet.sample]))
+      }
+    : null;
+  let cached = null;
+  if (planArgs) {
+    try {
+      cached = await mappingPlan.store.get(planArgs);
+    } catch {
+      cached = null;
+    }
+  }
+  const storedProjections = cached?.mapping?.projections || {};
+  const plannedSpecs = specs.map((sheet) => {
+    const stored = storedProjections[sheet.title];
+    return Array.isArray(stored) && stored.every((column) => Number.isInteger(column) && column >= 0)
+      ? { ...sheet, columns: stored }
+      : sheet;
+  });
+  if (planArgs && (!cached || plannedSpecs.some((sheet) => !Array.isArray(storedProjections[sheet.title])))) {
+    try {
+      await mappingPlan.store.put({
+        ...planArgs,
+        signatureRowsByTitle: new Map(sampled.map((sheet) => [sheet.title, shelfSignatureRows(sheet)])),
+        mapping: { projections: Object.fromEntries(plannedSpecs.map(({ title, columns }) => [title, columns])) }
+      });
+    } catch {
+      // A plan is an optimization; the live parser remains authoritative.
+    }
+  }
+  return readProjectedSheets(spreadsheetId, plannedSpecs, deps);
 }
 
 const defaultDeps = { getWorkbook, getSheetValues, getSheetValuesBatch, batchWrite };
 
+function withDefaults(deps) {
+  const provided = deps || {};
+  const result = {
+    ...provided,
+    getWorkbook: provided.getWorkbook || defaultDeps.getWorkbook,
+    getSheetValues: provided.getSheetValues || defaultDeps.getSheetValues,
+    batchWrite: provided.batchWrite || defaultDeps.batchWrite
+  };
+  if (provided.getSheetValuesBatch || !provided.getSheetValues) result.getSheetValuesBatch = provided.getSheetValuesBatch || defaultDeps.getSheetValuesBatch;
+  return result;
+}
+
 export async function collectShelfBook(book, businessDate, deps = defaultDeps) {
-  const workbook = await deps.getWorkbook(book.spreadsheetId);
+  const runDeps = withDefaults(deps);
+  const workbook = await runDeps.getWorkbook(book.spreadsheetId);
   const properties = workbook.sheets.filter(({ properties: sheet }) => !sheet?.title || sheet.title).map(({ properties: sheet }) => sheet);
-  const sheets = await readShelfSheets(book.spreadsheetId, properties, deps);
+  const sheets = await readShelfSheets(book.spreadsheetId, properties, runDeps, {
+    store: runDeps.mappingPlans,
+    workbook,
+    configurationId: book.id || book.spreadsheetId
+  });
   const rackSheets = sheets.filter((sheet) => classifyShelfSheet(sheet.values) === "rack");
   const visibleRackSheets = rackSheets.filter((sheet) => !sheet.hidden);
   const sourceSheets = visibleRackSheets.length ? visibleRackSheets : rackSheets;
@@ -448,13 +514,14 @@ async function verifyShelfWrites(book, preview, updates, deps) {
 }
 
 export async function executeShelfBook(book, businessDate, deps = defaultDeps) {
-  let preview = await collectShelfBook(book, businessDate, deps);
+  const runDeps = withDefaults(deps);
+  let preview = await collectShelfBook(book, businessDate, runDeps);
   const dateUpdates = [...new Map(preview.rows
     .flatMap((row) => [...(row.detail?.dateUpdates || []), ...(row.total?.dateUpdates || [])])
     .map((update) => [update.range, update])).values()];
   if (dateUpdates.length) {
-    await deps.batchWrite(book.spreadsheetId, dateUpdates);
-    preview = await collectShelfBook(book, businessDate, deps);
+    await runDeps.batchWrite(book.spreadsheetId, dateUpdates);
+    preview = await collectShelfBook(book, businessDate, runDeps);
   }
   const readyRows = preview.rows.filter((row) => row.status === "ready");
   const valueUpdates = readyRows.flatMap((row) => {
@@ -462,6 +529,6 @@ export async function executeShelfBook(book, businessDate, deps = defaultDeps) {
       .filter((target) => target?.status === "ready" && target.range)
       .map((target) => ({ range: target.range, value: row.sourceValue }));
   });
-  await deps.batchWrite(book.spreadsheetId, valueUpdates);
-  return valueUpdates.length ? verifyShelfWrites(book, preview, valueUpdates, deps) : preview;
+  await runDeps.batchWrite(book.spreadsheetId, valueUpdates);
+  return valueUpdates.length ? verifyShelfWrites(book, preview, valueUpdates, runDeps) : preview;
 }

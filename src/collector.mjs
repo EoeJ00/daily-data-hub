@@ -22,8 +22,8 @@ function findSourceHeader(values, aliases) {
   return null;
 }
 
-function extractChannel(values, source, channel, businessDate) {
-  const header = findSourceHeader(values, source.aliases);
+function extractChannel(values, source, channel, businessDate, mappedHeader) {
+  const header = mappedHeader || findSourceHeader(values, source.aliases);
   const targetChannel = channelColumnName(channel);
   if (!header) return [{ channel, targetChannel, metric: "结构", status: "error", message: "未找到日期/消耗表头" }];
   const matchesDate = values.slice(header.row + 1).filter((row) => dateKey(row[header.date], businessDate) === businessDate);
@@ -44,14 +44,22 @@ function aggregateMetric(rows, column, channel, metric) {
   return { channel, metric, status: "pending", sourceValue: numbers.reduce((sum, value) => sum + value, 0) };
 }
 
-function locateTarget(values, businessDate) {
+function locateTargetHeader(values) {
   for (let row = 0; row < Math.min(values.length, 12); row += 1) {
     const dateColumn = (values[row] || []).findIndex((cell) => matches(cell, ["日期", "时间", "date"]));
     if (dateColumn < 0) continue;
-    const dateRow = values.findIndex((cells, index) => index > row && dateKey(cells[dateColumn], businessDate) === businessDate);
-    return { headerRow: row, dateColumn, dateRow };
+    return { headerRow: row, dateColumn };
   }
   return null;
+}
+
+function locateTarget(values, businessDate) {
+  const header = locateTargetHeader(values);
+  if (!header) return null;
+  return {
+    ...header,
+    dateRow: values.findIndex((cells, index) => index > header.headerRow && dateKey(cells[header.dateColumn], businessDate) === businessDate)
+  };
 }
 
 function locateMetricColumn(values, target, channel, metric) {
@@ -71,7 +79,7 @@ function locateMetricColumn(values, target, channel, metric) {
   return -1;
 }
 
-function mapRows(rows, targetValues, target, datePlan, targetSheet, businessDate) {
+function mapRows(rows, targetValues, target, datePlan, targetSheet, businessDate, targetColumnMap = null) {
   const metricColumnCache = new Map();
   return rows.map((row) => {
     if (row.status !== "pending") return row;
@@ -81,7 +89,9 @@ function mapRows(rows, targetValues, target, datePlan, targetSheet, businessDate
     const cacheKey = `${normalized(targetChannel)}\u0000${row.metric}`;
     let column = metricColumnCache.get(cacheKey);
     if (column === undefined) {
-      column = locateMetricColumn(targetValues, target, row.channel, row.metric);
+      column = targetColumnMap && Object.prototype.hasOwnProperty.call(targetColumnMap, cacheKey)
+        ? targetColumnMap[cacheKey]
+        : locateMetricColumn(targetValues, target, row.channel, row.metric);
       metricColumnCache.set(cacheKey, column);
     }
     if (column < 0) return { ...row, targetChannel, status: "error", message: `总表未找到渠道指标列（匹配键：${targetChannel}）` };
@@ -107,32 +117,116 @@ function mapRows(rows, targetValues, target, datePlan, targetSheet, businessDate
 
 const defaultDeps = { batchWrite, getSheetValuesBatch, getWorkbook };
 
+function withDefaults(deps) {
+  return { ...defaultDeps, ...(deps || {}) };
+}
+
+function collectorConfiguration(source) {
+  return {
+    targetSheet: source.targetSheet,
+    excludedSheets: [...(source.excludedSheets || [])],
+    aliases: {
+      date: [...(source.aliases?.date || [])],
+      spend: [...(source.aliases?.spend || [])],
+      returnSpend: [...(source.aliases?.returnSpend || [])]
+    }
+  };
+}
+
+function collectorMapping(source, channels, sampleByTitle) {
+  const targetSample = sampleByTitle.get(source.targetSheet) || [];
+  const targetHeader = locateTargetHeader(targetSample);
+  const targetColumns = new Set(targetHeader ? [targetHeader.dateColumn] : []);
+  const targetColumnMap = {};
+  for (const channel of channels) {
+    for (const metric of ["消耗", "回流消耗"]) {
+      const cacheKey = `${normalized(channelColumnName(channel))}\u0000${metric}`;
+      const column = targetHeader ? locateMetricColumn(targetSample, targetHeader, channel, metric) : -1;
+      targetColumnMap[cacheKey] = column;
+      if (column >= 0) targetColumns.add(column);
+    }
+  }
+  const sourceHeaders = {};
+  const specs = [...new Set([source.targetSheet, ...channels])].map((title) => {
+    if (title === source.targetSheet) return { title, columns: [...targetColumns] };
+    const header = findSourceHeader(sampleByTitle.get(title) || [], source.aliases);
+    if (header) sourceHeaders[title] = header;
+    return { title, columns: header ? [...new Set([header.date, header.spend, header.returnSpend].filter((column) => column >= 0))] : [] };
+  });
+  const signatureRowsByTitle = new Map();
+  if (targetHeader) signatureRowsByTitle.set(source.targetSheet, [targetHeader.headerRow - 1, targetHeader.headerRow].filter((row) => row >= 0));
+  for (const [title, header] of Object.entries(sourceHeaders)) signatureRowsByTitle.set(title, [header.row]);
+  return {
+    cacheable: Boolean(targetHeader && channels.every((channel) => sourceHeaders[channel])),
+    targetSheet: source.targetSheet,
+    channels,
+    titles: specs.map(({ title }) => title),
+    targetHeader,
+    targetColumns: [...targetColumns],
+    targetColumnMap,
+    sourceHeaders,
+    specs,
+    signatureRowsByTitle
+  };
+}
+
+function usableCollectorMapping(mapping, source, channels) {
+  return Boolean(mapping
+    && mapping.targetSheet === source.targetSheet
+    && Array.isArray(mapping.channels)
+    && JSON.stringify(mapping.channels) === JSON.stringify(channels)
+    && Array.isArray(mapping.specs)
+    && mapping.specs.length === channels.length + 1
+    && mapping.sourceHeaders
+    && mapping.targetColumnMap);
+}
+
+async function resolveCollectorMapping(source, workbook, sampleByTitle, channels, deps) {
+  const store = deps.mappingPlans;
+  const args = {
+    scenario: "scenario-1",
+    configurationId: source.id || source.spreadsheetId,
+    workbookId: source.spreadsheetId,
+    configuration: collectorConfiguration(source),
+    workbook,
+    samples: sampleByTitle
+  };
+  if (store) {
+    try {
+      const cached = await store.get(args);
+      if (usableCollectorMapping(cached?.mapping, source, channels)) return cached.mapping;
+    } catch {
+      // A plan is an optimization; the live parser remains authoritative.
+    }
+  }
+  const mapping = collectorMapping(source, channels, sampleByTitle);
+  if (store && mapping.cacheable) {
+    try {
+      const { signatureRowsByTitle: _signatureRowsByTitle, cacheable: _cacheable, ...persistedMapping } = mapping;
+      await store.put({ ...args, signatureRowsByTitle: mapping.signatureRowsByTitle, mapping: persistedMapping });
+    } catch {
+      // Do not change collection behavior when the local cache cannot be written.
+    }
+  }
+  return mapping;
+}
+
 export async function collectWorkbook(source, businessDate, deps = defaultDeps) {
-  const workbook = await deps.getWorkbook(source.spreadsheetId);
+  const runDeps = withDefaults(deps);
+  const workbook = await runDeps.getWorkbook(source.spreadsheetId);
   const visibleSheets = workbook.sheets
     .filter(({ properties }) => !properties.hidden)
     .map(({ properties }) => properties.title);
   if (!visibleSheets.includes(source.targetSheet)) throw new Error(`未找到目标页签：${source.targetSheet}`);
   const channels = visibleSheets.filter((title) => !source.excludedSheets.includes(title));
   const titles = [...new Set([source.targetSheet, ...channels])];
-  const samples = await deps.getSheetValuesBatch(source.spreadsheetId, titles.map((title) => sheetHeaderRange(title)));
+  const samples = await runDeps.getSheetValuesBatch(source.spreadsheetId, titles.map((title) => sheetHeaderRange(title)));
   const sampleByTitle = new Map(titles.map((title, index) => [title, samples[index] || []]));
-  const targetSample = sampleByTitle.get(source.targetSheet) || [];
-  const targetHeader = locateTarget(targetSample, businessDate);
-  const targetColumns = new Set(targetHeader ? [targetHeader.dateColumn] : []);
-  for (const channel of channels) {
-    for (const metric of ["消耗", "回流消耗"]) {
-      const column = targetHeader ? locateMetricColumn(targetSample, targetHeader, channel, metric) : -1;
-      if (column >= 0) targetColumns.add(column);
-    }
-  }
-  const specs = titles.map((title) => {
-    if (title === source.targetSheet) return { title, columns: [...targetColumns] };
-    const header = findSourceHeader(sampleByTitle.get(title) || [], source.aliases);
-    return { title, columns: header ? [...new Set([header.date, header.spend, header.returnSpend].filter((column) => column >= 0))] : [] };
-  });
+  const mapping = await resolveCollectorMapping(source, workbook, sampleByTitle, channels, runDeps);
+  const targetHeader = mapping.targetHeader;
+  const specs = mapping.specs;
   const ranges = specs.flatMap(({ title, columns }) => columns.map((column) => sheetColumnRange(title, column)));
-  const projected = await deps.getSheetValuesBatch(source.spreadsheetId, ranges);
+  const projected = await runDeps.getSheetValuesBatch(source.spreadsheetId, ranges);
   let cursor = 0;
   const valuesByTitle = new Map(specs.map(({ title, columns }) => {
     const values = mergeProjectedColumns(columns, projected.slice(cursor, cursor + columns.length), sampleByTitle.get(title));
@@ -140,12 +234,17 @@ export async function collectWorkbook(source, businessDate, deps = defaultDeps) 
     return [title, values];
   }));
   const targetValues = valuesByTitle.get(source.targetSheet) || [];
-  const target = locateTarget(targetValues, businessDate);
+  const target = targetHeader
+    ? {
+        ...targetHeader,
+        dateRow: targetValues.findIndex((cells, index) => index > targetHeader.headerRow && dateKey(cells?.[targetHeader.dateColumn], businessDate) === businessDate)
+      }
+    : locateTarget(targetValues, businessDate);
   const datePlan = target
     ? planSequentialDateRows(targetValues, { row: target.headerRow, date: target.dateColumn }, businessDate, source.targetSheet)
     : null;
   const channelValues = channels.map((channel) => ({ channel, values: valuesByTitle.get(channel) || [] }));
-  const rows = channelValues.flatMap(({ channel, values }) => extractChannel(values, source, channel, businessDate));
+  const rows = channelValues.flatMap(({ channel, values }) => extractChannel(values, source, channel, businessDate, mapping.sourceHeaders?.[channel]));
   return {
     sourceId: source.id,
     sourceName: source.name,
@@ -153,21 +252,22 @@ export async function collectWorkbook(source, businessDate, deps = defaultDeps) 
     status: "success",
     businessDate,
     channelCount: channels.length,
-    rows: mapRows(rows, targetValues, target, datePlan, source.targetSheet, businessDate)
+    rows: mapRows(rows, targetValues, target, datePlan, source.targetSheet, businessDate, mapping.targetColumnMap)
   };
 }
 
 export async function executeWorkbook(source, businessDate, deps = defaultDeps) {
-  let preview = await collectWorkbook(source, businessDate, deps);
+  const runDeps = withDefaults(deps);
+  let preview = await collectWorkbook(source, businessDate, runDeps);
   const dateUpdates = [...new Map(preview.rows
     .flatMap((row) => row.dateUpdates || [])
     .map((update) => [update.range, update])).values()];
   if (dateUpdates.length) {
-    await deps.batchWrite(source.spreadsheetId, dateUpdates);
-    preview = await collectWorkbook(source, businessDate, deps);
+    await runDeps.batchWrite(source.spreadsheetId, dateUpdates);
+    preview = await collectWorkbook(source, businessDate, runDeps);
   }
   const ready = preview.rows.filter((row) => row.status === "ready");
-  await deps.batchWrite(source.spreadsheetId, ready.map((row) => ({ range: row.range, value: row.sourceValue })));
+  await runDeps.batchWrite(source.spreadsheetId, ready.map((row) => ({ range: row.range, value: row.sourceValue })));
   return {
     ...preview,
     rows: preview.rows.map((row) => row.status === "ready" ? { ...row, status: "written", message: "已写入并保留审计记录" } : row)

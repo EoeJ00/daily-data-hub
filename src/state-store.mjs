@@ -7,13 +7,15 @@ export class JsonStateStore {
   #file;
   #normalize;
   #defaultState;
+  #recover;
   #statePromise;
   #mutationQueue = Promise.resolve();
 
-  constructor(file, { defaultState, normalize = (value) => value } = {}) {
+  constructor(file, { defaultState, normalize = (value) => value, recover = false } = {}) {
     this.#file = file;
     this.#normalize = normalize;
     this.#defaultState = clone(defaultState ?? {});
+    this.#recover = recover;
   }
 
   async #load() {
@@ -22,6 +24,7 @@ export class JsonStateStore {
         .then((content) => this.#normalize(JSON.parse(content)))
         .catch((error) => {
           if (error.code === "ENOENT") return clone(this.#defaultState);
+          if (this.#recover) return clone(this.#defaultState);
           this.#statePromise = null;
           throw error;
         });

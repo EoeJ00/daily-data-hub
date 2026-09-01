@@ -10,6 +10,7 @@ import { clearWorkbookMetadataCache, getConnectionStatus, getSpreadsheetRevision
 import { JsonStateStore } from "./src/state-store.mjs";
 import { JobQueue } from "./src/job-queue.mjs";
 import { mapConcurrent } from "./src/async-utils.mjs";
+import { MappingPlanStore } from "./src/mapping-plans.mjs";
 import { MaterializedSnapshotStore, SnapshotSynchronizer } from "./src/materialized-snapshots.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -17,6 +18,7 @@ const publicDir = join(root, "public");
 const dataDir = join(root, "data");
 const stateFile = join(dataDir, "state.json");
 const snapshotFile = join(dataDir, "snapshots.json");
+const mappingPlanFile = join(dataDir, "mapping-plans.json");
 const port = Number(process.env.PORT || 4173);
 const host = process.env.HOST || "127.0.0.1";
 
@@ -47,6 +49,7 @@ const mimeTypes = {
 };
 
 const stateStore = new JsonStateStore(stateFile, { defaultState, normalize: normalizeState });
+const defaultMappingPlans = new MappingPlanStore(mappingPlanFile);
 
 export function normalizeState(raw) {
   const primary = raw.scenarios?.["scenario-1"];
@@ -255,20 +258,22 @@ const jobDefinitions = {
   }
 };
 
-async function executeScenarioJob({ scenario, type, businessDate, selected, definition, store, snapshots }) {
+async function executeScenarioJob({ scenario, type, businessDate, selected, definition, store, snapshots, mappingPlans }) {
   const execute = type === "run";
+  const collect = (item) => definition.collect(item, businessDate, { mappingPlans });
+  const executeItem = (item) => definition.execute(item, businessDate, { mappingPlans });
   const results = await mapConcurrent(selected, async (item) => {
     try {
-      if (execute) return await definition.execute(item, businessDate);
+      if (execute) return await executeItem(item);
       return snapshots
-        ? await snapshots.preview(scenario, item, businessDate, definition.collect)
-        : await definition.collect(item, businessDate);
+        ? await snapshots.preview(scenario, item, businessDate, collect)
+        : await collect(item);
     } catch (error) {
       return definition.failed(item, error);
     }
   }, 2);
   if (execute && snapshots) {
-    await Promise.all(selected.map((item) => snapshots.refreshAfterWrite(scenario, item, businessDate, definition.collect).catch(() => {})));
+    await Promise.all(selected.map((item) => snapshots.refreshAfterWrite(scenario, item, businessDate, collect).catch(() => {})));
   }
   const run = {
     id: crypto.randomUUID(),
@@ -286,7 +291,7 @@ async function executeScenarioJob({ scenario, type, businessDate, selected, defi
   return run;
 }
 
-async function runScenarioJob(request, response, scenario, type, store, queue, definitions, snapshots) {
+async function runScenarioJob(request, response, scenario, type, store, queue, definitions, snapshots, mappingPlans) {
   const definition = definitions[scenario];
   const body = await readJson(request);
   const businessDate = body.date || new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
@@ -298,10 +303,10 @@ async function runScenarioJob(request, response, scenario, type, store, queue, d
   try {
     if (type === "preview" && snapshots) {
       response.setHeader("x-data-source", "freshness-verified-preview");
-      return sendJson(response, 200, await executeScenarioJob({ scenario, type, businessDate, selected, definition, store, snapshots }));
+      return sendJson(response, 200, await executeScenarioJob({ scenario, type, businessDate, selected, definition, store, snapshots, mappingPlans }));
     }
     const queued = queue.enqueue(
-      () => executeScenarioJob({ scenario, type, businessDate, selected, definition, store, snapshots }),
+      () => executeScenarioJob({ scenario, type, businessDate, selected, definition, store, snapshots, mappingPlans }),
       { scenario, type, businessDate }
     );
     response.setHeader("x-job-id", queued.id);
@@ -426,10 +431,10 @@ async function handleApi(request, response, pathname, store, runtime) {
   const scopedJobMatch = pathname.match(/^\/api\/scenarios\/(scenario-[123])\/jobs\/(preview|run)$/);
   const legacyJobMatch = pathname.match(/^\/api\/jobs\/(preview|run)$/);
   if (request.method === "POST" && scopedJobMatch) {
-    return runScenarioJob(request, response, scopedJobMatch[1], scopedJobMatch[2], store, runtime.queue, runtime.jobs, runtime.snapshots);
+    return runScenarioJob(request, response, scopedJobMatch[1], scopedJobMatch[2], store, runtime.queue, runtime.jobs, runtime.snapshots, runtime.mappingPlans);
   }
   if (request.method === "POST" && legacyJobMatch) {
-    return runScenarioJob(request, response, "scenario-1", legacyJobMatch[1], store, runtime.queue, runtime.jobs, runtime.snapshots);
+    return runScenarioJob(request, response, "scenario-1", legacyJobMatch[1], store, runtime.queue, runtime.jobs, runtime.snapshots, runtime.mappingPlans);
   }
 
   return sendJson(response, 404, { error: "接口不存在" });
@@ -497,8 +502,8 @@ async function serveStatic(request, response, pathname) {
   }
 }
 
-export function createDailyDataServer({ store = stateStore, queue = new JobQueue(), jobs = jobDefinitions, snapshots = null, onShutdown = null, isShuttingDown = () => false } = {}) {
-  const runtime = { queue, jobs, snapshots, onShutdown, isShuttingDown };
+export function createDailyDataServer({ store = stateStore, queue = new JobQueue(), jobs, mappingPlans = defaultMappingPlans, snapshots = null, onShutdown = null, isShuttingDown = () => false } = {}) {
+  const runtime = { queue, jobs: jobs || jobDefinitions, mappingPlans, snapshots, onShutdown, isShuttingDown };
   return createServer(async (request, response) => {
     try {
       const { pathname } = new URL(request.url, `http://${request.headers.host}`);
