@@ -1,6 +1,6 @@
 import { batchWrite, getSheetValues, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
 import { mapConcurrent } from "./async-utils.mjs";
-import { combineTargetStatuses as combineStatus, dateKey, inspectTarget, isEmpty as empty, normalizeText as normalized, parseNumber, parseSheetRange, planSequentialDateRows, quoteSheetTitle, sheetHeaderRange, sheetRange } from "./spreadsheet-utils.mjs";
+import { combineTargetStatuses as combineStatus, columnName, dateKey, inspectTarget, isEmpty as empty, mergeProjectedColumns, normalizeText as normalized, parseNumber, parseSheetRange, planSequentialDateRows, quoteSheetTitle, sheetColumnRange, sheetHeaderRange, sheetRange } from "./spreadsheet-utils.mjs";
 
 export { dateKey } from "./spreadsheet-utils.mjs";
 const compact = (value) => normalized(value).replace(/[\-_—–（）()]/g, "");
@@ -273,24 +273,105 @@ function mapShelfTargets(records, businessDate, targetSheets, totalSheet) {
   return rows;
 }
 
-async function readShelfSheets(spreadsheetId, properties, deps) {
-  if (deps.getSheetValuesBatch) {
-    const samples = await deps.getSheetValuesBatch(spreadsheetId, properties.map((sheet) => sheetHeaderRange(sheet.title, 24)));
-    const sampled = properties.map((sheet, index) => ({ ...sheet, sample: samples[index] || [], kind: classifyShelfSheet(samples[index] || []) }));
-    const racks = sampled.filter((sheet) => sheet.kind === "rack");
-    const visibleRacks = racks.filter((sheet) => !sheet.hidden);
-    const selectedRacks = visibleRacks.length ? visibleRacks : racks;
-    const relevant = [...new Map([
-      ...selectedRacks,
-      ...sampled.filter((sheet) => sheet.kind === "shooter" || compact(sheet.title) === "总表")
-    ].map((sheet) => [sheet.title, sheet])).values()];
-    const values = await deps.getSheetValuesBatch(spreadsheetId, relevant.map((sheet) => quoteSheetTitle(sheet.title)));
-    return relevant.map((sheet, index) => ({ ...sheet, values: values[index] || [] }));
+const shelfHeaderRows = 24;
+
+function uniqueColumns(columns) {
+  return [...new Set(columns.filter((column) => Number.isInteger(column) && column >= 0))];
+}
+
+function totalLabelMatches(value, aliases) {
+  const raw = String(value ?? "").trim();
+  const text = compact(value);
+  const base = text.replace(/回流消耗$|回流$|消耗$|花费$/, "");
+  return [...new Set([raw, text, base].flatMap((candidate) => shooterAliases(candidate)))].some((alias) => aliases.has(alias));
+}
+
+function totalProjectionColumns(sample, header, targetSheets, sourceSheets) {
+  const aliases = new Set(targetSheets.flatMap((sheet) => shooterAliases(sheet.title)));
+  for (const source of sourceSheets) {
+    const sourceHeader = findHeader(source.sample, "rack");
+    if (!sourceHeader) continue;
+    for (const row of source.sample.slice(sourceHeader.row + 1)) {
+      for (const alias of shooterAliases(row?.[sourceHeader.name])) aliases.add(alias);
+    }
   }
-  return mapConcurrent(properties, async (sheet) => ({
+
+  const cells = sample[header.row] || [];
+  const columns = new Set([header.date]);
+  cells.forEach((cell, column) => {
+    if (column === header.date || column === header.total || !totalLabelMatches(cell, aliases)) return;
+    columns.add(column);
+    if (!/回流|消耗|花费/.test(String(cell ?? "")) && column + 1 < cells.length) columns.add(column + 1);
+  });
+  if (columns.size === 1) {
+    cells.forEach((cell, column) => {
+      if (column !== header.date && column !== header.total && !empty(cell)) columns.add(column);
+    });
+  }
+  return [...columns];
+}
+
+function projectionColumns(sheet, targetSheets, sourceSheets) {
+  if (sheet.kind === "rack" || sheet.kind === "shooter") {
+    const header = findHeader(sheet.sample, sheet.kind);
+    return header ? uniqueColumns([header.date, header.name, header.spend, header.returnSpend]) : [];
+  }
+  if (compact(sheet.title) !== "总表") return [];
+  const header = findTotalHeader(sheet.sample);
+  return header ? totalProjectionColumns(sheet.sample, header, targetSheets, sourceSheets) : [];
+}
+
+function projectedColumnValues(values, column) {
+  const rows = values || [];
+  const fullRows = rows.some((row) => Array.isArray(row) && row.length > 1);
+  return rows.map((row) => fullRows ? [row?.[column]] : row);
+}
+
+async function readProjectedSheets(spreadsheetId, specs, deps) {
+  if (deps.getSheetValuesBatch) {
+    const ranges = specs.flatMap((sheet) => sheet.columns.map((column) => sheetColumnRange(sheet.title, column)));
+    const projected = ranges.length ? await deps.getSheetValuesBatch(spreadsheetId, ranges) : [];
+    let cursor = 0;
+    return specs.map((sheet) => {
+      const values = mergeProjectedColumns(sheet.columns, projected.slice(cursor, cursor + sheet.columns.length), sheet.sample);
+      cursor += sheet.columns.length;
+      return { ...sheet, values };
+    });
+  }
+
+  const requests = specs.flatMap((sheet) => sheet.columns.map((column) => ({ sheet, column })));
+  const projected = await mapConcurrent(requests, async ({ sheet, column }) => {
+    const range = `${columnName(column)}:${columnName(column)}`;
+    const values = await deps.getSheetValues(spreadsheetId, sheet.title, { range });
+    return projectedColumnValues(values, column);
+  }, 6);
+  let cursor = 0;
+  return specs.map((sheet) => {
+    const values = mergeProjectedColumns(sheet.columns, projected.slice(cursor, cursor + sheet.columns.length), sheet.sample);
+    cursor += sheet.columns.length;
+    return { ...sheet, values };
+  });
+}
+
+async function readShelfSheets(spreadsheetId, properties, deps) {
+  const samples = deps.getSheetValuesBatch
+    ? await deps.getSheetValuesBatch(spreadsheetId, properties.map((sheet) => sheetHeaderRange(sheet.title, shelfHeaderRows)))
+    : await mapConcurrent(properties, (sheet) => deps.getSheetValues(spreadsheetId, sheet.title, { range: `1:${shelfHeaderRows}` }), 6);
+  const sampled = properties.map((sheet, index) => ({ ...sheet, sample: samples[index] || [], kind: classifyShelfSheet(samples[index] || []) }));
+  const racks = sampled.filter((sheet) => sheet.kind === "rack");
+  const visibleRacks = racks.filter((sheet) => !sheet.hidden);
+  const selectedRacks = visibleRacks.length ? visibleRacks : racks;
+  const targetSheets = sampled.filter((sheet) => sheet.kind === "shooter");
+  const relevant = [...new Map([
+    ...selectedRacks,
+    ...targetSheets,
+    ...sampled.filter((sheet) => compact(sheet.title) === "总表")
+  ].map((sheet) => [sheet.title, sheet])).values()];
+  const specs = relevant.map((sheet) => ({
     ...sheet,
-    values: await deps.getSheetValues(spreadsheetId, sheet.title)
-  }), 6);
+    columns: projectionColumns(sheet, targetSheets, selectedRacks)
+  }));
+  return readProjectedSheets(spreadsheetId, specs, deps);
 }
 
 const defaultDeps = { getWorkbook, getSheetValues, getSheetValuesBatch, batchWrite };

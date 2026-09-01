@@ -59,6 +59,7 @@ test("aggregates one shooter across multiple rack packages and maps both metrics
     ["book:C", shooterC],
     ["book:总表", total]
   ]);
+  const readBatches = [];
   const deps = {
     getWorkbook: async () => ({ properties: { title: "架上包数据表" }, sheets: [
       { properties: { title: "架上包 A", hidden: false } },
@@ -67,17 +68,24 @@ test("aggregates one shooter across multiple rack packages and maps both metrics
       { properties: { title: "总表", hidden: false } }
     ] }),
     getSheetValues: async (id, sheet) => values.get(`${id}:${sheet}`) || [],
-    getSheetValuesBatch: async (id, ranges) => ranges.map((range) => {
-      const sheetPart = range.split("!")[0];
-      const title = sheetPart.slice(1, -1).replaceAll("''", "'");
-      const full = values.get(`${id}:${title}`) || [];
-      const cell = range.split("!")[1];
-      if (!cell) return full;
-      if (/^\d+:\d+$/.test(cell)) return full.slice(0, Number(cell.split(":")[1]));
-      const match = cell.match(/^([A-Z]+)(\d+)$/);
-      const column = [...match[1]].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
-      return [[full[Number(match[2]) - 1]?.[column]]];
-    })
+    getSheetValuesBatch: async (id, ranges) => {
+      readBatches.push(ranges);
+      return ranges.map((range) => {
+        const sheetPart = range.split("!")[0];
+        const title = sheetPart.slice(1, -1).replaceAll("''", "'");
+        const full = values.get(`${id}:${title}`) || [];
+        const cell = range.split("!")[1];
+        if (!cell) return full;
+        if (/^\d+:\d+$/.test(cell)) return full.slice(0, Number(cell.split(":")[1]));
+        if (/^[A-Z]+:[A-Z]+$/.test(cell)) {
+          const column = [...cell.split(":")[0]].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
+          return full.map((row) => [row?.[column]]);
+        }
+        const match = cell.match(/^([A-Z]+)(\d+)$/);
+        const column = [...match[1]].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
+        return [[full[Number(match[2]) - 1]?.[column]]];
+      });
+    }
   };
   const result = await collectShelfBook({ id: "book-id", name: "架上包数据表", spreadsheetId: "book" }, "2026-08-13", deps);
   assert.equal(result.sourceSheetCount, 2);
@@ -92,6 +100,13 @@ test("aggregates one shooter across multiple rack packages and maps both metrics
   assert.equal(result.rows[1].detail.range, "'C'!E5");
   assert.equal(result.rows[1].total.range, "'总表'!D2");
   assert.equal(result.rows[0].packageDetails.length, 2);
+  assert.ok(readBatches[1].every((range) => range.includes("!")));
+  assert.deepEqual(readBatches[1], [
+    "'架上包 A'!A:A", "'架上包 A'!B:B", "'架上包 A'!D:D", "'架上包 A'!E:E",
+    "'架上包 B'!A:A", "'架上包 B'!B:B", "'架上包 B'!D:D", "'架上包 B'!E:E",
+    "'C'!A:A", "'C'!B:B", "'C'!D:D", "'C'!E:E",
+    "'总表'!A:A", "'总表'!C:C", "'总表'!D:D"
+  ]);
 
   const writes = [];
   const executed = await executeShelfBook({ id: "book-id", name: "架上包数据表", spreadsheetId: "book" }, "2026-08-13", {
@@ -115,6 +130,59 @@ test("aggregates one shooter across multiple rack packages and maps both metrics
   assert.deepEqual(writes.map((item) => item.range).sort(), ["'C'!D5", "'C'!E5", "'总表'!C2", "'总表'!D2"]);
 });
 
+test("rebuilds shelf-pack results from single-column reads when batch reads are unavailable", async () => {
+  const values = new Map([
+    ["book:架上包 A", [
+      ["架上包 A"],
+      ["日期", "投手/包名", "服务费", "消耗", "回流消耗"],
+      [46247, "C", 0, 10, 1],
+      [null, "架上包 A", 0, 10, 1]
+    ]],
+    ["book:C", [
+      ["C"], [], [],
+      ["日期", "渠道名", "服务费", "消耗", "回流消耗"],
+      [46247, "Aero Parcel 1939", 0, null, null]
+    ]],
+    ["book:总表", [
+      ["日期", "总消耗（USD）", "C", "C回流"],
+      [46247, null, null, null]
+    ]]
+  ]);
+  const reads = [];
+  const columnIndex = (letters) => [...letters].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
+  const deps = {
+    getWorkbook: async () => ({ properties: { title: "架上包数据表" }, sheets: [
+      { properties: { title: "架上包 A", hidden: false } },
+      { properties: { title: "C", hidden: false } },
+      { properties: { title: "总表", hidden: false } }
+    ] }),
+    getSheetValues: async (id, title, options = {}) => {
+      const range = options.range;
+      reads.push({ title, range });
+      assert.ok(range, `禁止无范围读取页签：${title}`);
+      const rows = values.get(`${id}:${title}`) || [];
+      if (range === "1:24") return rows.slice(0, 24);
+      const match = range.match(/^([A-Z]+):([A-Z]+)$/);
+      assert.ok(match && match[1] === match[2], `只允许单列范围读取：${title}!${range}`);
+      const column = columnIndex(match[1]);
+      return rows.map((row) => [row?.[column]]);
+    }
+  };
+
+  const result = await collectShelfBook({ id: "book-id", name: "架上包数据表", spreadsheetId: "book" }, "2026-08-13", deps);
+  assert.deepEqual(result.rows.map((row) => [row.shooter, row.metric, row.sourceValue, row.targetSheet, row.totalSheet, row.status]), [
+    ["c", "消耗", 10, "C", "总表", "ready"],
+    ["c", "回流消耗", 1, "C", "总表", "ready"]
+  ]);
+  assert.equal(result.rows[0].detail.range, "'C'!D5");
+  assert.equal(result.rows[0].total.range, "'总表'!C2");
+  const projectionReads = reads.filter(({ range }) => range !== "1:24");
+  assert.equal(reads.filter(({ range }) => range === "1:24").length, 3);
+  assert.ok(projectionReads.length > 0);
+  assert.ok(projectionReads.every(({ range }) => /^[A-Z]+:[A-Z]+$/.test(range)));
+  assert.ok(projectionReads.some(({ title, range }) => title === "总表" && range === "C:C"));
+});
+
 test("appends missing shooter dates in sequence before writing metrics", async () => {
   const values = new Map([
     ["book:架上包 A", [["日期", "投手/包名", "服务费", "消耗", "回流消耗"], ["2026-08-15", "C", 0, 10, 1]]],
@@ -124,6 +192,11 @@ test("appends missing shooter dates in sequence before writing metrics", async (
   const location = (range) => {
     const [quotedTitle, cell] = range.split("!");
     const title = quotedTitle.slice(1, -1).replaceAll("''", "'");
+    const columnMatch = cell?.match(/^([A-Z]+):([A-Z]+)$/);
+    if (columnMatch) {
+      const column = [...columnMatch[1]].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
+      return { title, column };
+    }
     const match = cell?.match(/^([A-Z]+)(\d+)$/);
     if (!match) return { title };
     const column = [...match[1]].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
@@ -139,6 +212,7 @@ test("appends missing shooter dates in sequence before writing metrics", async (
     getSheetValuesBatch: async (id, ranges) => ranges.map((range) => {
       const target = location(range);
       const sheet = values.get(`${id}:${target.title}`) || [];
+      if (target.column !== undefined && target.row === undefined) return sheet.map((row) => [row?.[target.column]]);
       return target.row === undefined ? sheet : [[sheet[target.row]?.[target.column]]];
     })
   };
