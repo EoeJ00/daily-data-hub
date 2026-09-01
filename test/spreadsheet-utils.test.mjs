@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { columnName, combineTargetStatuses, dateKey, inspectTarget, parseNumber, parseSheetRange, planSequentialDateRows, quoteSheetTitle, sheetRange } from "../src/spreadsheet-utils.mjs";
+import { columnName, combineTargetStatuses, dateKey, inspectTarget, locateDateWindows, mergeProjectedColumnWindows, parseNumber, parseSheetRange, planSequentialDateRows, quoteSheetTitle, sheetColumnWindowRange, sheetRange } from "../src/spreadsheet-utils.mjs";
 
 test("provides stable spreadsheet number, date, range, and status primitives", () => {
   assert.deepEqual(parseNumber("￥1,234.50"), { kind: "number", value: 1234.5 });
@@ -26,4 +26,53 @@ test("only appends sequential dates after the last shooter date", () => {
     ]
   });
   assert.match(planSequentialDateRows(values, { row: 0, date: 0 }, "2026-08-12", "S").error, /无法向下追加/);
+});
+
+test("locates merged date blocks and keeps absolute row offsets for window reads", () => {
+  const values = [
+    ["日期", "渠道"],
+    ["2026-08-12", "old"],
+    ["2026-08-13", "first"],
+    ["", "second"],
+    ["", "summary"],
+    ["汇总", ""],
+    ["2026-08-14", "next"]
+  ];
+  assert.deepEqual(locateDateWindows(values, { headerRow: 0, dateColumn: 0, businessDate: "2026-08-13" }), {
+    ok: true,
+    found: true,
+    windows: [{ startRow: 2, endRow: 5 }],
+    row: 2,
+    startRow: 2,
+    endRow: 5,
+    lastDatedRow: 6
+  });
+  assert.equal(sheetColumnWindowRange("S", 1, 100, 103), "'S'!B101:B103");
+  assert.deepEqual(mergeProjectedColumnWindows([["日期"]], [{ column: 1, startRow: 4, values: [[10], [11]] }]), [
+    ["日期"],
+    ,
+    ,
+    ,
+    [, 10],
+    [, 11]
+  ]);
+});
+
+test("rejects date-like malformed cells so callers can use the full-read fallback", () => {
+  const result = locateDateWindows([["日期"], ["2026/8"], ["2026-08-13"]], {
+    headerRow: 0,
+    dateColumn: 0,
+    businessDate: "2026-08-13"
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.found, false);
+});
+
+test("rejects impossible normalized dates", () => {
+  const result = locateDateWindows([["日期"], ["2026/13/40"], ["2026-08-13"]], {
+    headerRow: 0,
+    dateColumn: 0,
+    businessDate: "2026-08-13"
+  });
+  assert.equal(result.ok, false);
 });

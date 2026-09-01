@@ -1,5 +1,5 @@
 import { batchWrite, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
-import { dateKey, isEmpty as empty, mergeProjectedColumns, normalizeText as normalized, parseNumber, planSequentialDateRows, sheetColumnRange, sheetHeaderRange, sheetRange } from "./spreadsheet-utils.mjs";
+import { dateKey, isEmpty as empty, locateDateWindows, mergeProjectedColumnWindows, mergeProjectedColumns, normalizeText as normalized, parseNumber, planSequentialDateRows, projectedColumnValues, sheetColumnRange, sheetColumnWindowRange, sheetHeaderRange, sheetRange } from "./spreadsheet-utils.mjs";
 
 function channelColumnName(channel) {
   const displayName = String(channel ?? "").trim();
@@ -171,13 +171,26 @@ function collectorMapping(source, channels, sampleByTitle) {
 }
 
 function usableCollectorMapping(mapping, source, channels) {
+  const validColumns = (columns) => Array.isArray(columns) && columns.every((column) => Number.isInteger(column) && column >= 0);
+  const validSourceHeader = (header) => header
+    && Number.isInteger(header.row) && header.row >= 0
+    && Number.isInteger(header.date) && header.date >= 0
+    && Number.isInteger(header.spend) && header.spend >= -1
+    && Number.isInteger(header.returnSpend) && header.returnSpend >= -1
+    && (header.spend >= 0 || header.returnSpend >= 0);
   return Boolean(mapping
     && mapping.targetSheet === source.targetSheet
     && Array.isArray(mapping.channels)
     && JSON.stringify(mapping.channels) === JSON.stringify(channels)
     && Array.isArray(mapping.specs)
     && mapping.specs.length === channels.length + 1
+    && JSON.stringify(mapping.specs.map((spec) => spec?.title)) === JSON.stringify([source.targetSheet, ...channels])
+    && mapping.specs.every((spec) => spec && typeof spec.title === "string" && validColumns(spec.columns))
+    && mapping.targetHeader
+    && Number.isInteger(mapping.targetHeader.headerRow) && mapping.targetHeader.headerRow >= 0
+    && Number.isInteger(mapping.targetHeader.dateColumn) && mapping.targetHeader.dateColumn >= 0
     && mapping.sourceHeaders
+    && channels.every((channel) => validSourceHeader(mapping.sourceHeaders[channel]))
     && mapping.targetColumnMap);
 }
 
@@ -211,6 +224,103 @@ async function resolveCollectorMapping(source, workbook, sampleByTitle, channels
   return mapping;
 }
 
+const collectorSampleRows = 20;
+const maxCollectorDateWindows = 32;
+
+function collectorHeaderFor(source, mapping, title) {
+  return title === source.targetSheet ? mapping.targetHeader : mapping.sourceHeaders?.[title];
+}
+
+function collectorDateColumn(source, mapping, title) {
+  const header = collectorHeaderFor(source, mapping, title);
+  return title === source.targetSheet ? header?.dateColumn : header?.date;
+}
+
+async function readCollectorValues(source, businessDate, mapping, sampleByTitle, deps) {
+  const specs = mapping.specs;
+  const readFull = async () => {
+    const ranges = specs.flatMap(({ title, columns }) => columns.map((column) => sheetColumnRange(title, column)));
+    const projected = ranges.length ? await deps.getSheetValuesBatch(source.spreadsheetId, ranges) : [];
+    let cursor = 0;
+    return new Map(specs.map(({ title, columns }) => {
+      const values = mergeProjectedColumns(columns, projected.slice(cursor, cursor + columns.length), sampleByTitle.get(title));
+      cursor += columns.length;
+      return [title, values];
+    }));
+  };
+
+  const dateSpecs = specs.map((spec) => ({
+    ...spec,
+    dateColumn: collectorDateColumn(source, mapping, spec.title),
+    header: collectorHeaderFor(source, mapping, spec.title),
+    sample: sampleByTitle.get(spec.title) || []
+  }));
+  if (dateSpecs.some(({ dateColumn, header }) => !header || !Number.isInteger(dateColumn) || dateColumn < 0)) return readFull();
+
+  const dateValues = new Map();
+  if (!dateSpecs.some(({ sample }) => sample.length >= collectorSampleRows)) return readFull();
+  const dateReads = dateSpecs;
+
+  let indexedColumns;
+  try {
+    const ranges = dateReads.map((spec) => sheetColumnRange(spec.title, spec.dateColumn));
+    indexedColumns = await deps.getSheetValuesBatch(source.spreadsheetId, ranges);
+  } catch {
+    return readFull();
+  }
+  dateReads.forEach((spec, index) => {
+    const columnValues = projectedColumnValues(indexedColumns[index] || [], spec.dateColumn);
+    dateValues.set(spec.title, mergeProjectedColumns([spec.dateColumn], [columnValues], spec.sample));
+  });
+
+  const windowsByTitle = new Map();
+  for (const spec of dateSpecs) {
+    const values = dateValues.get(spec.title) || [];
+    const index = locateDateWindows(values, {
+      headerRow: spec.header.row ?? spec.header.headerRow,
+      dateColumn: spec.dateColumn,
+      businessDate
+    });
+    if (!index.ok || index.windows.length > maxCollectorDateWindows) return readFull();
+    if (spec.title === source.targetSheet) {
+      const datePlan = planSequentialDateRows(values, { row: spec.header.headerRow, date: spec.dateColumn }, businessDate, spec.title);
+      windowsByTitle.set(spec.title, datePlan.error ? [] : [{ startRow: datePlan.row, endRow: datePlan.row + 1 }]);
+    } else {
+      windowsByTitle.set(spec.title, index.windows);
+    }
+  }
+
+  const reads = [];
+  for (const spec of dateSpecs) {
+    const windows = windowsByTitle.get(spec.title) || [];
+    for (const column of spec.columns.filter((value) => value !== spec.dateColumn)) {
+      for (const window of windows) reads.push({ title: spec.title, column, ...window });
+    }
+  }
+  let projected = [];
+  try {
+    projected = reads.length
+      ? await deps.getSheetValuesBatch(source.spreadsheetId, reads.map(({ title, column, startRow, endRow }) => sheetColumnWindowRange(title, column, startRow, endRow)))
+      : [];
+  } catch {
+    return readFull();
+  }
+  return new Map(specs.map((spec) => {
+    const values = dateValues.get(spec.title) || spec.sample;
+    const ranges = [];
+    const offset = reads.findIndex(({ title }) => title === spec.title);
+    const count = reads.filter(({ title }) => title === spec.title).length;
+    if (offset >= 0) {
+      let cursor = offset;
+      for (const read of reads.slice(offset, offset + count)) {
+        ranges.push({ ...read, values: projectedColumnValues(projected[cursor] || [], read.column) });
+        cursor += 1;
+      }
+    }
+    return [spec.title, mergeProjectedColumnWindows(values, ranges)];
+  }));
+}
+
 export async function collectWorkbook(source, businessDate, deps = defaultDeps) {
   const runDeps = withDefaults(deps);
   const workbook = await runDeps.getWorkbook(source.spreadsheetId);
@@ -224,15 +334,7 @@ export async function collectWorkbook(source, businessDate, deps = defaultDeps) 
   const sampleByTitle = new Map(titles.map((title, index) => [title, samples[index] || []]));
   const mapping = await resolveCollectorMapping(source, workbook, sampleByTitle, channels, runDeps);
   const targetHeader = mapping.targetHeader;
-  const specs = mapping.specs;
-  const ranges = specs.flatMap(({ title, columns }) => columns.map((column) => sheetColumnRange(title, column)));
-  const projected = await runDeps.getSheetValuesBatch(source.spreadsheetId, ranges);
-  let cursor = 0;
-  const valuesByTitle = new Map(specs.map(({ title, columns }) => {
-    const values = mergeProjectedColumns(columns, projected.slice(cursor, cursor + columns.length), sampleByTitle.get(title));
-    cursor += columns.length;
-    return [title, values];
-  }));
+  const valuesByTitle = await readCollectorValues(source, businessDate, mapping, sampleByTitle, runDeps);
   const targetValues = valuesByTitle.get(source.targetSheet) || [];
   const target = targetHeader
     ? {

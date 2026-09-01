@@ -1,6 +1,6 @@
 import { batchWrite, getSheetValues, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
 import { mapConcurrent } from "./async-utils.mjs";
-import { combineTargetStatuses as combineStatus, columnName, dateKey, inspectTarget, isEmpty as empty, mergeProjectedColumns, normalizeText as normalized, parseNumber, parseSheetRange, planSequentialDateRows, quoteSheetTitle, sheetColumnRange, sheetHeaderRange, sheetRange } from "./spreadsheet-utils.mjs";
+import { combineTargetStatuses as combineStatus, columnName, dateKey, inspectTarget, isEmpty as empty, locateDateWindows, mergeProjectedColumnWindows, mergeProjectedColumns, normalizeText as normalized, parseNumber, parseSheetRange, planSequentialDateRows, projectedColumnValues, quoteSheetTitle, sheetColumnRange, sheetColumnWindowRange, sheetHeaderRange, sheetRange } from "./spreadsheet-utils.mjs";
 
 export { dateKey } from "./spreadsheet-utils.mjs";
 const compact = (value) => normalized(value).replace(/[\-_—–（）()]/g, "");
@@ -328,39 +328,135 @@ function shelfSignatureRows(sheet) {
   return header ? [header.row] : [];
 }
 
-function projectedColumnValues(values, column) {
-  const rows = values || [];
-  const fullRows = rows.some((row) => Array.isArray(row) && row.length > 1);
-  return rows.map((row) => fullRows ? [row?.[column]] : row);
-}
+const maxShelfDateWindows = 32;
 
-async function readProjectedSheets(spreadsheetId, specs, deps) {
+async function readFullProjectedSheets(spreadsheetId, specs, deps) {
   if (deps.getSheetValuesBatch) {
-    const ranges = specs.flatMap((sheet) => sheet.columns.map((column) => sheetColumnRange(sheet.title, column)));
+    const ranges = specs.flatMap((sheet) => sheet.columns === null
+      ? [quoteSheetTitle(sheet.title)]
+      : sheet.columns.map((column) => sheetColumnRange(sheet.title, column)));
     const projected = ranges.length ? await deps.getSheetValuesBatch(spreadsheetId, ranges) : [];
     let cursor = 0;
     return specs.map((sheet) => {
+      if (sheet.columns === null) return { ...sheet, values: projected[cursor++] || [] };
       const values = mergeProjectedColumns(sheet.columns, projected.slice(cursor, cursor + sheet.columns.length), sheet.sample);
       cursor += sheet.columns.length;
       return { ...sheet, values };
     });
   }
 
-  const requests = specs.flatMap((sheet) => sheet.columns.map((column) => ({ sheet, column })));
+  const requests = specs.flatMap((sheet) => sheet.columns === null
+    ? [{ sheet, column: null }]
+    : sheet.columns.map((column) => ({ sheet, column })));
   const projected = await mapConcurrent(requests, async ({ sheet, column }) => {
+    if (column === null) return deps.getSheetValues(spreadsheetId, sheet.title);
     const range = `${columnName(column)}:${columnName(column)}`;
     const values = await deps.getSheetValues(spreadsheetId, sheet.title, { range });
     return projectedColumnValues(values, column);
   }, 6);
   let cursor = 0;
   return specs.map((sheet) => {
+    if (sheet.columns === null) return { ...sheet, values: projected[cursor++] || [] };
     const values = mergeProjectedColumns(sheet.columns, projected.slice(cursor, cursor + sheet.columns.length), sheet.sample);
     cursor += sheet.columns.length;
     return { ...sheet, values };
   });
 }
 
-async function readShelfSheets(spreadsheetId, properties, deps, mappingPlan) {
+function shelfDateSpec(sheet) {
+  const header = sheet.kind === "rack" || sheet.kind === "shooter"
+    ? findHeader(sheet.sample, sheet.kind)
+    : compact(sheet.title) === "总表" ? findTotalHeader(sheet.sample) : null;
+  if (!header) return null;
+  const target = sheet.kind === "shooter" || compact(sheet.title) === "总表";
+  return {
+    ...sheet,
+    dateColumn: header.date,
+    dateColumns: [header.date],
+    headerRow: header.row,
+    windowMode: target ? "single" : "block"
+  };
+}
+
+async function readShelfRanges(spreadsheetId, reads, deps) {
+  if (!reads.length) return [];
+  if (deps.getSheetValuesBatch) {
+    return deps.getSheetValuesBatch(spreadsheetId, reads.map(({ title, column, startRow, endRow }) => sheetColumnWindowRange(title, column, startRow, endRow)));
+  }
+  return mapConcurrent(reads, ({ title, column, startRow, endRow }) => deps.getSheetValues(
+    spreadsheetId,
+    title,
+    { range: `${columnName(column)}${startRow + 1}:${columnName(column)}${endRow}` }
+  ), 6);
+}
+
+async function readProjectedSheets(spreadsheetId, specs, businessDate, deps) {
+  if (specs.some((sheet) => sheet.columns === null)) return readFullProjectedSheets(spreadsheetId, specs, deps);
+  const complete = specs.every((sheet) => sheet.sample.length < shelfHeaderRows);
+  if (complete) return readFullProjectedSheets(spreadsheetId, specs, deps);
+
+  const dateSpecs = specs.map(shelfDateSpec);
+  if (dateSpecs.some((sheet) => !sheet)) return readFullProjectedSheets(spreadsheetId, specs, deps);
+
+  const dateValues = new Map();
+  const dateReads = dateSpecs;
+  let indexed = [];
+  try {
+    if (dateReads.length) {
+      indexed = deps.getSheetValuesBatch
+        ? await deps.getSheetValuesBatch(spreadsheetId, dateReads.map((sheet) => sheetColumnRange(sheet.title, sheet.dateColumn)))
+        : await mapConcurrent(dateReads, (sheet) => deps.getSheetValues(
+            spreadsheetId,
+            sheet.title,
+            { range: `${columnName(sheet.dateColumn)}:${columnName(sheet.dateColumn)}` }
+          ), 6);
+    }
+  } catch {
+    return readFullProjectedSheets(spreadsheetId, specs, deps);
+  }
+  dateReads.forEach((sheet, index) => dateValues.set(
+    sheet.title,
+    mergeProjectedColumns([sheet.dateColumn], [projectedColumnValues(indexed[index] || [], sheet.dateColumn)], sheet.sample)
+  ));
+
+  const reads = [];
+  for (const sheet of dateSpecs) {
+    const values = dateValues.get(sheet.title) || [];
+    const index = locateDateWindows(values, {
+      headerRow: sheet.headerRow,
+      dateColumn: sheet.dateColumn,
+      businessDate
+    });
+    if (!index.ok || index.windows.length > maxShelfDateWindows) return readFullProjectedSheets(spreadsheetId, specs, deps);
+    let windows = index.windows;
+    if (sheet.windowMode === "single") {
+      const datePlan = planSequentialDateRows(values, { row: sheet.headerRow, date: sheet.dateColumn }, businessDate, sheet.title);
+      windows = datePlan.error ? [] : [{ startRow: datePlan.row, endRow: datePlan.row + 1 }];
+    }
+    for (const column of sheet.columns.filter((value) => value !== sheet.dateColumn)) {
+      for (const window of windows) reads.push({ title: sheet.title, column, ...window });
+    }
+  }
+
+  let projected = [];
+  try {
+    projected = await readShelfRanges(spreadsheetId, reads, deps);
+  } catch {
+    return readFullProjectedSheets(spreadsheetId, specs, deps);
+  }
+  const projectedByTitle = new Map();
+  reads.forEach((read, index) => {
+    const values = projectedByTitle.get(read.title) || [];
+    values.push({ ...read, values: projectedColumnValues(projected[index] || [], read.column) });
+    projectedByTitle.set(read.title, values);
+  });
+  return dateSpecs.map((sheet) => ({
+    ...sheet,
+    values: mergeProjectedColumnWindows(dateValues.get(sheet.title) || sheet.sample, projectedByTitle.get(sheet.title) || [])
+  }));
+}
+
+async function readShelfSheets(spreadsheetId, properties, businessDate, deps, mappingPlan) {
   const samples = deps.getSheetValuesBatch
     ? await deps.getSheetValuesBatch(spreadsheetId, properties.map((sheet) => sheetHeaderRange(sheet.title, shelfHeaderRows)))
     : await mapConcurrent(properties, (sheet) => deps.getSheetValues(spreadsheetId, sheet.title, { range: `1:${shelfHeaderRows}` }), 6);
@@ -404,10 +500,15 @@ async function readShelfSheets(spreadsheetId, properties, deps, mappingPlan) {
   }
   const storedProjections = cached?.mapping?.projections || {};
   const plannedSpecs = specs.map((sheet) => {
-    const stored = storedProjections[sheet.title];
-    return Array.isArray(stored) && stored.every((column) => Number.isInteger(column) && column >= 0)
-      ? { ...sheet, columns: stored }
-      : sheet;
+    const hasStored = Object.prototype.hasOwnProperty.call(storedProjections, sheet.title);
+    const stored = hasStored ? storedProjections[sheet.title] : undefined;
+    if (!hasStored) return sheet;
+    if (stored === null) return { ...sheet, columns: null };
+    const width = Math.max(0, ...sheet.sample.map((row) => row?.length || 0));
+    const valid = Array.isArray(stored)
+      && stored.every((column) => Number.isInteger(column) && column >= 0 && (!width || column < width))
+      && sheet.columns.every((column) => stored.includes(column));
+    return valid ? { ...sheet, columns: stored } : { ...sheet, columns: null };
   });
   if (planArgs && (!cached || plannedSpecs.some((sheet) => !Array.isArray(storedProjections[sheet.title])))) {
     try {
@@ -420,7 +521,7 @@ async function readShelfSheets(spreadsheetId, properties, deps, mappingPlan) {
       // A plan is an optimization; the live parser remains authoritative.
     }
   }
-  return readProjectedSheets(spreadsheetId, plannedSpecs, deps);
+  return readProjectedSheets(spreadsheetId, plannedSpecs, businessDate, deps);
 }
 
 const defaultDeps = { getWorkbook, getSheetValues, getSheetValuesBatch, batchWrite };
@@ -441,7 +542,7 @@ export async function collectShelfBook(book, businessDate, deps = defaultDeps) {
   const runDeps = withDefaults(deps);
   const workbook = await runDeps.getWorkbook(book.spreadsheetId);
   const properties = workbook.sheets.filter(({ properties: sheet }) => !sheet?.title || sheet.title).map(({ properties: sheet }) => sheet);
-  const sheets = await readShelfSheets(book.spreadsheetId, properties, runDeps, {
+  const sheets = await readShelfSheets(book.spreadsheetId, properties, businessDate, runDeps, {
     store: runDeps.mappingPlans,
     workbook,
     configurationId: book.id || book.spreadsheetId

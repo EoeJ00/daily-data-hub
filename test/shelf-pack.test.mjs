@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { classifyShelfSheet, collectShelfBook, executeShelfBook, extractShelfPackRecords } from "../src/shelf-pack.mjs";
+import { classifyShelfSheet, collectShelfBook, dateKey, executeShelfBook, extractShelfPackRecords } from "../src/shelf-pack.mjs";
 
 test("classifies merged-date rack sheets separately from shooter sheets", () => {
   assert.equal(classifyShelfSheet([
@@ -294,4 +294,74 @@ test("uses the column immediately right of a shooter code for generic return hea
   assert.equal(spendRow.total.range, "'总表'!E2");
   assert.equal(returnRow.detail.range, "'C'!G2");
   assert.equal(returnRow.total.range, "'总表'!F2");
+});
+
+test("reads a large rack date block and exact shooter/total target rows", async () => {
+  const targetIndex = 500;
+  const rowCount = 1000;
+  const businessDate = dateKey(46247 + targetIndex, "2026-08-13");
+  const rack = [
+    ["架上包 A"],
+    ["日期", "投手/包名", "服务费", "消耗", "回流消耗"],
+    ...Array.from({ length: rowCount }, (_, index) => [
+      index === targetIndex + 1 ? null : 46247 + index,
+      "C",
+      0,
+      index === targetIndex ? 10 : index === targetIndex + 1 ? 4 : null,
+      index === targetIndex ? 1 : index === targetIndex + 1 ? 0.5 : null
+    ])
+  ];
+  const shooter = [
+    ["日期", "渠道名", "服务费", "消耗", "回流消耗"],
+    ...Array.from({ length: rowCount }, (_, index) => [46247 + index, "A", 0, null, null])
+  ];
+  const total = [
+    ["日期", "总消耗", "C", "C回流"],
+    ...Array.from({ length: rowCount }, (_, index) => [46247 + index, null, null, null])
+  ];
+  const values = new Map([
+    ["book:架上包 A", rack],
+    ["book:C", shooter],
+    ["book:总表", total]
+  ]);
+  const readBatches = [];
+  const columnIndex = (letters) => [...letters].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
+  const getSheetValuesBatch = async (id, ranges) => {
+    readBatches.push(ranges);
+    return ranges.map((range) => {
+      const [sheetPart, selector] = range.split("!");
+      const title = sheetPart.slice(1, -1).replaceAll("''", "'");
+      const rows = values.get(`${id}:${title}`) || [];
+      if (/^\d+:\d+$/.test(selector)) return rows.slice(0, Number(selector.split(":")[1]));
+      const whole = selector.match(/^([A-Z]+):([A-Z]+)$/i);
+      if (whole) return rows.map((row) => [row?.[columnIndex(whole[1].toUpperCase())]]);
+      const window = selector.match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/i);
+      assert.ok(window, `unexpected range ${range}`);
+      assert.equal(window[1].toUpperCase(), window[3].toUpperCase());
+      const column = columnIndex(window[1].toUpperCase());
+      return rows.slice(Number(window[2]) - 1, Number(window[4])).map((row) => [row?.[column]]);
+    });
+  };
+  const deps = {
+    getWorkbook: async () => ({ properties: { title: "架上包数据表" }, sheets: [
+      { properties: { title: "架上包 A", hidden: false } },
+      { properties: { title: "C", hidden: false } },
+      { properties: { title: "总表", hidden: false } }
+    ] }),
+    getSheetValuesBatch
+  };
+
+  const result = await collectShelfBook({ id: "large-book", name: "架上包数据表", spreadsheetId: "book" }, businessDate, deps);
+
+  assert.deepEqual(result.rows.map((row) => [row.metric, row.sourceValue, row.status, row.detail.range, row.total.range]), [
+    ["消耗", 14, "ready", "'C'!D502", "'总表'!C502"],
+    ["回流消耗", 1.5, "ready", "'C'!E502", "'总表'!D502"]
+  ]);
+  assert.deepEqual(readBatches[1], ["'架上包 A'!A:A", "'C'!A:A", "'总表'!A:A"]);
+  assert.deepEqual(readBatches[2], [
+    "'架上包 A'!B503:B504", "'架上包 A'!D503:D504", "'架上包 A'!E503:E504",
+    "'C'!B502:B502", "'C'!D502:D502", "'C'!E502:E502",
+    "'总表'!C502:C502", "'总表'!D502:D502"
+  ]);
+  assert.ok(readBatches[2].every((range) => !/![A-Z]+:[A-Z]+$/i.test(range)));
 });

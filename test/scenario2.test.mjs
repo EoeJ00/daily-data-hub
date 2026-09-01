@@ -261,7 +261,7 @@ test("matches semantic fields and compound channel suffixes without workbook-spe
   assert.ok(preview.rows.every((row) => row.status === "same"));
   assert.deepEqual([...new Set(preview.rows.map((row) => row.routeKey))], ["RS9-CS-11-1", "RS9-CS-11-4"]);
   assert.equal(preview.rows.find((row) => row.channel.endsWith("11-4") && row.metric === "回流消耗").targetSheet, "RS9-CS-11-4(SUKI)");
-  assert.equal(totalReads, 1);
+  assert.equal(totalReads, 2);
 });
 
 test("writes detail rows first, rechecks them, and then writes the total", async () => {
@@ -341,4 +341,136 @@ test("rejects a standalone chain sheet when the requested date is absent", () =>
   const rows = extractStandaloneChainRecords([["日期", "消耗", "回流消耗"], [46248, 10, 1]], "2026-08-13", "MMY-XIONG-SS1-34(ROY)", "MMY-XIONG-SS1-34(ROY)");
   assert.equal(rows.length, 2);
   assert.ok(rows.every((row) => row.status === "error"));
+});
+
+test("reads large multi-table source blocks and own targets without projecting full non-date columns", async () => {
+  const targetIndex = 500;
+  const businessDate = dateKey(46247 + targetIndex, "2026-08-13");
+  const rowCount = 1000;
+  const clientRows = [
+    ["日期", "渠道号", "花费（U）", "回流"],
+    ...Array.from({ length: rowCount }, (_, index) => [
+      46247 + index,
+      "MMY-XIONG-SS1-34",
+      index === targetIndex ? 10.25 : null,
+      index === targetIndex ? 0.86 : null
+    ])
+  ];
+  const ownTotal = [
+    ["日期", "34", "34回流"],
+    ...Array.from({ length: rowCount }, (_, index) => [46247 + index, null, null])
+  ];
+  const ownDetail = [
+    ["日期", "渠道号", "花费（U）", "回流"],
+    ...Array.from({ length: rowCount }, (_, index) => [46247 + index, "34", null, null])
+  ];
+  const values = new Map([
+    ["client:日报", clientRows],
+    ["own:总表", ownTotal],
+    ["own:34(ROY)", ownDetail]
+  ]);
+  const rangesSeen = [];
+  const columnIndex = (letters) => [...letters].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
+  const read = async (id, ranges) => {
+    rangesSeen.push({ id, ranges });
+    return ranges.map((range) => {
+      const [sheetPart, selector] = range.split("!");
+      const title = sheetPart.slice(1, -1).replaceAll("''", "'");
+      const rows = values.get(`${id}:${title}`) || [];
+      if (/^\d+:\d+$/.test(selector)) return rows.slice(0, Number(selector.split(":")[1]));
+      const whole = selector.match(/^([A-Z]+):([A-Z]+)$/i);
+      if (whole) {
+        assert.equal(whole[1].toUpperCase(), whole[2].toUpperCase());
+        const column = columnIndex(whole[1].toUpperCase());
+        return rows.map((row) => [row?.[column]]);
+      }
+      const window = selector.match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/i);
+      assert.ok(window, `unexpected range ${range}`);
+      assert.equal(window[1].toUpperCase(), window[3].toUpperCase());
+      const column = columnIndex(window[1].toUpperCase());
+      return rows.slice(Number(window[2]) - 1, Number(window[4])).map((row) => [row?.[column]]);
+    });
+  };
+  const clientWorkbook = { properties: { title: "甲方" }, sheets: [{ properties: { sheetId: 1, title: "日报", hidden: false } }] };
+  const ownWorkbook = { properties: { title: "乙方" }, sheets: ["总表", "34(ROY)"].map((title, index) => ({ properties: { sheetId: index + 1, title, hidden: false } })) };
+  const pair = { id: "large-pair", name: "large", client: { spreadsheetId: "client", gid: "1" }, own: { spreadsheetId: "own" }, targetSheet: "总表" };
+  const result = await collectScenario2Pair(pair, businessDate, {
+    getWorkbook: async (id) => id === "client" ? clientWorkbook : ownWorkbook,
+    getSheetValuesBatch: read
+  });
+
+  assert.deepEqual(result.rows.map((row) => [row.metric, row.sourceValue, row.status, row.detail.range, row.total.range]), [
+    ["消耗", 10.25, "ready", "'34(ROY)'!C502", "'总表'!B502"],
+    ["回流消耗", 0.86, "ready", "'34(ROY)'!D502", "'总表'!C502"]
+  ]);
+  const clientWindow = rangesSeen.find(({ id, ranges }) => id === "client" && ranges.some((range) => /!B502:B502$/.test(range)));
+  assert.deepEqual(clientWindow.ranges, ["'日报'!B502:B502", "'日报'!C502:C502", "'日报'!D502:D502"]);
+  const ownWindow = rangesSeen.find(({ id, ranges }) => id === "own" && ranges.some((range) => /!B502:B502$/.test(range)));
+  assert.deepEqual(ownWindow.ranges, [
+    "'总表'!B502:B502", "'总表'!C502:C502",
+    "'34(ROY)'!B502:B502", "'34(ROY)'!C502:C502", "'34(ROY)'!D502:D502"
+  ]);
+  assert.ok([...clientWindow.ranges, ...ownWindow.ranges].every((range) => !/![A-Z]+:[A-Z]+$/i.test(range)));
+});
+
+test("indexes large multiline client sheets by their date carrier column", async () => {
+  const targetIndex = 500;
+  const rowCount = 1000;
+  const businessDate = dateKey(46247 + targetIndex, "2026-08-13");
+  const textDate = businessDate.replaceAll("-", ".");
+  const clientRows = Array.from({ length: rowCount }, (_, index) => [
+    `${index === targetIndex ? textDate : "2026.08.12"}\n34(ROY) 消耗：${index === targetIndex ? "10.25" : "1"} 回流消耗：${index === targetIndex ? "0.86" : "0.1"}`
+  ]);
+  const ownTotal = [
+    ["日期", "34", "34回流"],
+    ...Array.from({ length: rowCount }, (_, index) => [46247 + index, null, null])
+  ];
+  const ownDetail = [
+    ["日期", "渠道号", "花费（U）", "回流"],
+    ...Array.from({ length: rowCount }, (_, index) => [46247 + index, "34", null, null])
+  ];
+  const values = new Map([
+    ["client:日报大单元格", clientRows],
+    ["own:总表", ownTotal],
+    ["own:34(ROY)", ownDetail]
+  ]);
+  const rangesSeen = [];
+  const columnIndex = (letters) => [...letters].reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0) - 1;
+  const read = async (id, ranges) => {
+    rangesSeen.push({ id, ranges });
+    return ranges.map((range) => {
+      const [sheetPart, selector] = range.split("!");
+      const title = sheetPart.slice(1, -1).replaceAll("''", "'");
+      const rows = values.get(`${id}:${title}`) || [];
+      if (/^\d+:\d+$/.test(selector)) return rows.slice(0, Number(selector.split(":")[1]));
+      const whole = selector.match(/^([A-Z]+):([A-Z]+)$/i);
+      if (whole) return rows.map((row) => [row?.[columnIndex(whole[1].toUpperCase())]]);
+      const window = selector.match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/i);
+      assert.ok(window, `unexpected range ${range}`);
+      assert.equal(window[1].toUpperCase(), window[3].toUpperCase());
+      const column = columnIndex(window[1].toUpperCase());
+      return rows.slice(Number(window[2]) - 1, Number(window[4])).map((row) => [row?.[column]]);
+    });
+  };
+  const clientWorkbook = { properties: { title: "甲方" }, sheets: [{ properties: { sheetId: 1, title: "日报大单元格", hidden: false } }] };
+  const ownWorkbook = { properties: { title: "乙方" }, sheets: ["总表", "34(ROY)"].map((title, index) => ({ properties: { sheetId: index + 1, title, hidden: false } })) };
+  const pair = { id: "big-cell-pair", name: "big-cell", client: { spreadsheetId: "client", gid: "1" }, own: { spreadsheetId: "own" }, targetSheet: "总表" };
+
+  const result = await collectScenario2Pair(pair, businessDate, {
+    getWorkbook: async (id) => id === "client" ? clientWorkbook : ownWorkbook,
+    getSheetValuesBatch: read
+  });
+
+  assert.deepEqual(result.rows.map((row) => [row.metric, row.sourceValue, row.status]), [
+    ["消耗", 10.25, "ready"],
+    ["回流消耗", 0.86, "ready"]
+  ]);
+  const clientDateRead = rangesSeen.find(({ id, ranges }) => id === "client" && ranges.length === 1 && ranges[0] === "'日报大单元格'!A:A");
+  assert.ok(clientDateRead);
+  assert.ok(!rangesSeen.some(({ id, ranges }) => id === "client" && ranges.some((range) => range === "'日报大单元格'")));
+  const ownWindow = rangesSeen.find(({ id, ranges }) => id === "own" && ranges.some((range) => /!B502:B502$/.test(range)));
+  assert.deepEqual(ownWindow.ranges, [
+    "'总表'!B502:B502", "'总表'!C502:C502",
+    "'34(ROY)'!B502:B502", "'34(ROY)'!C502:C502", "'34(ROY)'!D502:D502"
+  ]);
 });

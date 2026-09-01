@@ -1,6 +1,6 @@
 import { batchWrite, getSheetValues, getSheetValuesBatch, getWorkbook } from "./google-sheets.mjs";
 import { mapConcurrent } from "./async-utils.mjs";
-import { combineTargetStatuses as combineStatus, dateKey, inspectTarget as inspectSpreadsheetTarget, isEmpty as empty, mergeProjectedColumns, parseNumber as parseSpreadsheetNumber, planSequentialDateRows, quoteSheetTitle, sheetColumnRange, sheetRange } from "./spreadsheet-utils.mjs";
+import { combineTargetStatuses as combineStatus, columnName, dateKey, inspectTarget as inspectSpreadsheetTarget, isEmpty as empty, locateDateWindows, mergeDateWindows, mergeProjectedColumnWindows, mergeProjectedColumns, parseNumber as parseSpreadsheetNumber, planSequentialDateRows, projectedColumnValues, quoteSheetTitle, sheetColumnRange, sheetColumnWindowRange, sheetRange } from "./spreadsheet-utils.mjs";
 import { looseRouteScore, normalizeRoute, normalizeScenarioText as normalized, routeIdentity, routeScore, shooterFallbackScore, totalChainScore } from "./scenario2-route.mjs";
 
 export { dateKey } from "./spreadsheet-utils.mjs";
@@ -221,12 +221,23 @@ function findHeaders(values, businessDate) {
 async function readProjectedClientValues(spreadsheetId, sheetTitle, businessDate, deps, mappingPlan) {
   const values = await readProjectedSheetMap(spreadsheetId, [sheetTitle], deps, (sample) => {
     const headers = findHeaders(sample, businessDate);
-    if (!headers.length) return null;
-    return {
+    if (headers.length) return {
       columns: [...new Set(headers.flatMap(({ date, channel, spend, returnSpend }) => [date, channel, spend, returnSpend]).filter((column) => column >= 0))],
+      dateColumns: [...new Set(headers.map(({ date }) => date).filter((column) => column >= 0))],
+      headerRow: headers[0].row,
       signatureRows: headers.map(({ row }) => row)
     };
-  }, { mappingPlan });
+    const columns = findBigCellColumns(sample, businessDate);
+    return columns.length ? {
+      columns,
+      dateColumns: columns,
+      headerRow: -1,
+      windowMode: "row",
+      validateDate: false,
+      parseDate: (value) => bigCellDateMatches(value, businessDate) ? businessDate : "",
+      signatureRows: []
+    } : null;
+  }, { mappingPlan, businessDate });
   return values.get(sheetTitle) || [];
 }
 
@@ -438,9 +449,12 @@ async function collectChainSheetRecords(pair, businessDate, clientSheets, ownDes
     if (!headers.length) return null;
     return {
       columns: [...new Set(headers.flatMap(({ date, channel, spend, returnSpend }) => [date, channel, spend, returnSpend]).filter((column) => column >= 0))],
+      dateColumns: [...new Set(headers.map(({ date }) => date).filter((column) => column >= 0))],
+      headerRow: headers[0].row,
       signatureRows: headers.map(({ row }) => row)
     };
   }, {
+    businessDate,
     mappingPlan: {
       store: deps.mappingPlans,
       workbook: clientWorkbook,
@@ -507,13 +521,58 @@ function locateTotal(values, businessDate) {
   return null;
 }
 
-async function readSheetMap(spreadsheetId, titles, deps, options = {}) {
-  const { mappingPlan: _mappingPlan, ...readOptions } = options;
-  const uniqueTitles = [...new Set(titles)];
+function bigCellDateMatches(value, businessDate) {
+  return String(value ?? "").split(/\r?\n/).some((line) => dateInText(line, businessDate) === businessDate);
+}
+
+function findBigCellColumns(values, businessDate) {
+  const width = Math.max(0, ...values.map((row) => row?.length || 0));
+  return Array.from({ length: width }, (_, column) => column)
+    .filter((column) => values.some((row) => {
+      const value = row?.[column];
+      return (String(value ?? "").includes("\n") || String(value ?? "").includes("\r"))
+        && String(value ?? "").split(/\r?\n/).some((line) => dateInText(line, businessDate));
+    }));
+}
+
+const scenarioSampleRows = 20;
+const maxDateWindows = 32;
+
+function normalizeIdentified(identified) {
+  if (Array.isArray(identified)) return { columns: identified, signatureRows: [] };
+  return identified || null;
+}
+
+function validProjectionColumns(columns, sample = []) {
+  const width = Math.max(0, ...sample.map((row) => row?.length || 0));
+  return Array.isArray(columns)
+    && columns.every((column) => Number.isInteger(column) && column >= 0)
+    && (!width || columns.every((column) => column < width));
+}
+
+function compatibleProjection(stored, identified, sample) {
+  return validProjectionColumns(stored, sample)
+    && (!Array.isArray(identified) || identified.every((column) => stored.includes(column)));
+}
+
+function sampleValues(values) {
+  return (values || []).slice(0, scenarioSampleRows);
+}
+
+async function readFullProjectedSheetMap(spreadsheetId, specs, deps, readOptions) {
+  const uniqueTitles = [...new Set(specs.map(({ title }) => title))];
   if (deps.getSheetValuesBatch) {
-    const ranges = uniqueTitles.map(quoteSheetTitle);
-    const values = await deps.getSheetValuesBatch(spreadsheetId, ranges, readOptions);
-    return new Map(uniqueTitles.map((title, index) => [title, values[index] || []]));
+    const ranges = specs.flatMap(({ title, columns }) => columns === null
+      ? [quoteSheetTitle(title)]
+      : columns.map((column) => sheetColumnRange(title, column)));
+    const values = ranges.length ? await deps.getSheetValuesBatch(spreadsheetId, ranges, readOptions) : [];
+    let cursor = 0;
+    return new Map(specs.map(({ title, sample, columns }) => {
+      if (columns === null) return [title, values[cursor++] || []];
+      const sheetValues = mergeProjectedColumns(columns, values.slice(cursor, cursor + columns.length), sample);
+      cursor += columns.length;
+      return [title, sheetValues];
+    }));
   }
   return new Map(await mapConcurrent(uniqueTitles, async (title) => [
     title,
@@ -521,11 +580,125 @@ async function readSheetMap(spreadsheetId, titles, deps, options = {}) {
   ], 6));
 }
 
+async function readRanges(spreadsheetId, ranges, deps, readOptions) {
+  if (!ranges.length) return [];
+  if (deps.getSheetValuesBatch) {
+    return deps.getSheetValuesBatch(
+      spreadsheetId,
+      ranges.map(({ title, column, startRow, endRow }) => sheetColumnWindowRange(title, column, startRow, endRow)),
+      readOptions
+    );
+  }
+  return mapConcurrent(ranges, async ({ title, column, startRow, endRow }) => deps.getSheetValues(
+    spreadsheetId,
+    title,
+    { ...readOptions, range: `${columnName(column)}${startRow + 1}:${columnName(column)}${endRow}` }
+  ), 6);
+}
+
+function locateSpecDateWindows(spec, businessDate, dateValues) {
+  const windows = [];
+  for (const dateColumn of spec.dateColumns) {
+    const index = locateDateWindows(dateValues, {
+      headerRow: spec.headerRow,
+      dateColumn,
+      businessDate,
+      parse: spec.parseDate || ((value) => dateKey(value, businessDate)),
+      block: spec.windowMode !== "row",
+      validate: spec.validateDate !== false
+    });
+    if (!index.ok) return null;
+    windows.push(...index.windows);
+  }
+  return mergeDateWindows(windows);
+}
+
+async function readWindowedProjectedSheetMap(spreadsheetId, specs, deps, readOptions, businessDate) {
+  if (specs.some((spec) => spec.columns === null || !validProjectionColumns(spec.columns, spec.sample))) {
+    return readFullProjectedSheetMap(spreadsheetId, specs, deps, readOptions);
+  }
+  const complete = specs.every((spec) => spec.sample.length < scenarioSampleRows);
+  if (complete) {
+    return readFullProjectedSheetMap(spreadsheetId, specs, deps, readOptions);
+  }
+
+  if (specs.some((spec) => !spec.dateColumns.length)) return readFullProjectedSheetMap(spreadsheetId, specs, deps, readOptions);
+
+  const dateValues = new Map();
+  const dateReads = specs.flatMap((spec) => spec.dateColumns.map((column) => ({ ...spec, column })));
+
+  let indexed = [];
+  try {
+    if (dateReads.length) {
+      indexed = deps.getSheetValuesBatch
+        ? await deps.getSheetValuesBatch(spreadsheetId, dateReads.map(({ title, column }) => sheetColumnRange(title, column)), readOptions)
+        : await mapConcurrent(dateReads, ({ title, column }) => deps.getSheetValues(
+            spreadsheetId,
+            title,
+            { ...readOptions, range: `${columnName(column)}:${columnName(column)}` }
+          ), 6);
+    }
+  } catch {
+    return readFullProjectedSheetMap(spreadsheetId, specs, deps, readOptions);
+  }
+
+  const indexedByTitle = new Map();
+  dateReads.forEach((read, index) => {
+    const values = indexedByTitle.get(read.title) || [];
+    values.push({ column: read.column, values: projectedColumnValues(indexed[index] || [], read.column) });
+    indexedByTitle.set(read.title, values);
+  });
+  for (const spec of specs) {
+    let values = dateValues.get(spec.title) || spec.sample;
+    for (const read of indexedByTitle.get(spec.title) || []) {
+      values = mergeProjectedColumns([read.column], [read.values], values);
+    }
+    dateValues.set(spec.title, values);
+  }
+
+  const reads = [];
+  for (const spec of specs) {
+    const values = dateValues.get(spec.title) || [];
+    const windows = locateSpecDateWindows(spec, businessDate, values);
+    if (!windows || windows.length > maxDateWindows) return readFullProjectedSheetMap(spreadsheetId, specs, deps, readOptions);
+    let selected = windows;
+    if (spec.windowMode === "single") {
+      const datePlan = planSequentialDateRows(values, { row: spec.headerRow, date: spec.dateColumns[0] }, businessDate, spec.title);
+      selected = datePlan.error ? [] : [{ startRow: datePlan.row, endRow: datePlan.row + 1 }];
+    }
+    for (const column of spec.columns.filter((value) => !spec.dateColumns.includes(value))) {
+      for (const window of selected) reads.push({ title: spec.title, column, ...window });
+    }
+  }
+
+  let projected = [];
+  try {
+    projected = await readRanges(spreadsheetId, reads, deps, readOptions);
+  } catch {
+    return readFullProjectedSheetMap(spreadsheetId, specs, deps, readOptions);
+  }
+  const projectedByTitle = new Map();
+  reads.forEach((read, index) => {
+    const values = projectedByTitle.get(read.title) || [];
+    values.push({ ...read, values: projectedColumnValues(projected[index] || [], read.column) });
+    projectedByTitle.set(read.title, values);
+  });
+  return new Map(specs.map((spec) => [
+    spec.title,
+    mergeProjectedColumnWindows(dateValues.get(spec.title) || spec.sample, projectedByTitle.get(spec.title) || [])
+  ]));
+}
+
 async function readProjectedSheetMap(spreadsheetId, titles, deps, identifyColumns, options = {}) {
   const uniqueTitles = [...new Set(titles)];
-  const { mappingPlan, ...readOptions } = options;
-  if (!deps.getSheetValuesBatch) return readSheetMap(spreadsheetId, uniqueTitles, deps, readOptions);
-  const samples = await deps.getSheetValuesBatch(spreadsheetId, uniqueTitles.map((title) => `${quoteSheetTitle(title)}!1:20`), readOptions);
+  const { mappingPlan, businessDate, ...readOptions } = options;
+  const samples = deps.getSheetValuesBatch
+    ? await deps.getSheetValuesBatch(spreadsheetId, uniqueTitles.map((title) => `${quoteSheetTitle(title)}!1:20`), readOptions)
+    : await mapConcurrent(uniqueTitles, async (title) => sampleValues(await deps.getSheetValues(
+        spreadsheetId,
+        title,
+        { ...readOptions, range: `1:${scenarioSampleRows}` }
+      )), 6);
   const sampleByTitle = new Map(uniqueTitles.map((title, index) => [title, samples[index] || []]));
   const planArgs = mappingPlan?.store && mappingPlan.workbook
     ? {
@@ -547,15 +720,27 @@ async function readProjectedSheetMap(spreadsheetId, titles, deps, identifyColumn
   }
   const projections = cached?.mapping?.projections || {};
   const specs = uniqueTitles.map((title, index) => {
-    const stored = Object.prototype.hasOwnProperty.call(projections, title) ? projections[title] : undefined;
-    if (stored === null || (Array.isArray(stored) && stored.every((column) => Number.isInteger(column) && column >= 0))) {
-      return { title, sample: samples[index] || [], columns: stored };
-    }
-    const identified = identifyColumns(samples[index] || [], title);
-    const normalized = Array.isArray(identified)
-      ? { columns: identified, signatureRows: [] }
-      : identified || { columns: null, signatureRows: [] };
-    return { title, sample: samples[index] || [], columns: normalized.columns, signatureRows: normalized.signatureRows || [] };
+    const hasStored = Object.prototype.hasOwnProperty.call(projections, title);
+    const stored = hasStored ? projections[title] : undefined;
+    const identified = normalizeIdentified(identifyColumns(samples[index] || [], title));
+    const columns = hasStored
+      ? stored === null
+        ? null
+        : compatibleProjection(stored, identified?.columns, samples[index] || []) ? stored : null
+      : validProjectionColumns(identified?.columns, samples[index] || []) ? identified.columns : null;
+    const dateColumns = [...new Set((identified?.dateColumns || (Number.isInteger(identified?.dateColumn) ? [identified.dateColumn] : []))
+      .filter((column) => Number.isInteger(column) && column >= 0))];
+    return {
+      title,
+      sample: samples[index] || [],
+      columns,
+      signatureRows: identified?.signatureRows || [],
+      dateColumns,
+      headerRow: Number.isInteger(identified?.headerRow) ? identified.headerRow : -1,
+      windowMode: identified?.windowMode || "block",
+      parseDate: identified?.parseDate,
+      validateDate: identified?.validateDate
+    };
   });
   if (planArgs && (!cached || specs.some((spec) => !Object.prototype.hasOwnProperty.call(projections, spec.title)))) {
     try {
@@ -568,17 +753,7 @@ async function readProjectedSheetMap(spreadsheetId, titles, deps, identifyColumn
       // A plan is an optimization; the live parser remains authoritative.
     }
   }
-  const ranges = specs.flatMap(({ title, columns }) => columns === null
-    ? [quoteSheetTitle(title)]
-    : columns.map((column) => sheetColumnRange(title, column)));
-  const values = await deps.getSheetValuesBatch(spreadsheetId, ranges, readOptions);
-  let cursor = 0;
-  return new Map(specs.map(({ title, sample, columns }) => {
-    if (columns === null) return [title, values[cursor++] || []];
-    const sheetValues = mergeProjectedColumns(columns, values.slice(cursor, cursor + columns.length), sample);
-    cursor += columns.length;
-    return [title, sheetValues];
-  }));
+  return readWindowedProjectedSheetMap(spreadsheetId, specs, deps, readOptions, businessDate);
 }
 
 async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
@@ -607,6 +782,9 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
       }
       return {
         columns: [...columns],
+        dateColumns: [target.dateColumn],
+        headerRow: target.headerRow,
+        windowMode: "single",
         signatureRows: [target.headerRow - 1, target.headerRow].filter((row) => row >= 0)
       };
     }
@@ -614,10 +792,14 @@ async function mapTargets(pair, businessDate, sourceRows, ownWorkbook, deps) {
     return header
       ? {
           columns: [...new Set([header.date, header.channel, header.spend, header.returnSpend].filter((column) => column >= 0))],
+          dateColumns: [header.date],
+          headerRow: header.row,
+          windowMode: "single",
           signatureRows: [header.row]
         }
       : { columns: [], signatureRows: [] };
   }, {
+    businessDate,
     valueRenderOption: "FORMATTED_VALUE",
     mappingPlan: {
       store: deps.mappingPlans,

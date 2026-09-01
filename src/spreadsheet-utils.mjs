@@ -49,6 +49,19 @@ export function sheetColumnRange(title, column) {
   return `${quoteSheetTitle(title)}!${name}:${name}`;
 }
 
+export function sheetColumnWindowRange(title, column, startRow, endRow) {
+  const name = columnName(column);
+  const firstRow = Number.isInteger(startRow) ? Math.max(0, startRow) : 0;
+  const lastRow = Number.isInteger(endRow) ? Math.max(firstRow + 1, endRow) : firstRow + 1;
+  return `${quoteSheetTitle(title)}!${name}${firstRow + 1}:${name}${lastRow}`;
+}
+
+export function projectedColumnValues(values, column) {
+  const rows = values || [];
+  const fullRows = rows.some((row) => Array.isArray(row) && row.length > 1);
+  return rows.map((row) => fullRows ? [row?.[column]] : row);
+}
+
 export function mergeProjectedColumns(columns, valueRanges, sample = []) {
   const rows = sample.map((row) => [...row]);
   columns.forEach((column, rangeIndex) => {
@@ -58,6 +71,110 @@ export function mergeProjectedColumns(columns, valueRanges, sample = []) {
     });
   });
   return rows;
+}
+
+export function mergeProjectedColumnWindows(sample = [], reads = []) {
+  const rows = sample.map((row) => [...row]);
+  for (const { column, startRow, values } of reads) {
+    (values || []).forEach((row, rowIndex) => {
+      const absoluteRow = startRow + rowIndex;
+      if (!rows[absoluteRow]) rows[absoluteRow] = [];
+      rows[absoluteRow][column] = row?.[0];
+    });
+  }
+  return rows;
+}
+
+function dateCell(row, column, columnOnly = false) {
+  if (!Array.isArray(row)) return undefined;
+  return row[column] ?? (columnOnly && row.length === 1 ? row[0] : undefined);
+}
+
+function looksDateLike(value) {
+  const text = String(value ?? "").trim();
+  return Boolean(text && /\d/.test(text) && /[-/.年月日]/.test(text));
+}
+
+function validDateKey(value) {
+  const text = String(value ?? "");
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return false;
+  const time = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  return Number.isFinite(time) && new Date(time).toISOString().slice(0, 10) === text;
+}
+
+export function mergeDateWindows(windows) {
+  const sorted = [...(windows || [])]
+    .filter(({ startRow, endRow }) => Number.isInteger(startRow) && Number.isInteger(endRow) && endRow > startRow)
+    .sort((left, right) => left.startRow - right.startRow || left.endRow - right.endRow);
+  const merged = [];
+  for (const window of sorted) {
+    const previous = merged.at(-1);
+    if (previous && window.startRow <= previous.endRow) {
+      previous.endRow = Math.max(previous.endRow, window.endRow);
+    } else {
+      merged.push({ startRow: window.startRow, endRow: window.endRow });
+    }
+  }
+  return merged;
+}
+
+export function locateDateWindows(values, {
+  headerRow = -1,
+  dateColumn,
+  businessDate,
+  parse = (value) => dateKey(value, businessDate),
+  block = true,
+  validate = true
+} = {}) {
+  if (!Array.isArray(values) || !Number.isInteger(headerRow) || headerRow < -1 || !Number.isInteger(dateColumn) || dateColumn < 0) {
+    return { ok: false, found: false, windows: [], row: -1, lastDatedRow: -1 };
+  }
+
+  const target = String(businessDate ?? "");
+  const markers = [];
+  let lastDatedRow = -1;
+  let malformed = false;
+  const columnOnly = values.length > 0 && values.every((row) => Array.isArray(row) && row.length <= 1);
+  for (let row = Math.max(0, headerRow + 1); row < values.length; row += 1) {
+    const value = dateCell(values[row], dateColumn, columnOnly);
+    if (isEmpty(value)) continue;
+    let parsed;
+    try {
+      parsed = parse(value);
+    } catch {
+      malformed = true;
+      continue;
+    }
+    const matches = Array.isArray(parsed) ? parsed : [parsed];
+    if (matches.some((item) => item === target)) markers.push(row);
+    if (matches.some((item) => item && !validDateKey(item))) {
+      malformed = true;
+    } else if (matches.some(Boolean)) {
+      lastDatedRow = row;
+    } else if (validate && looksDateLike(value)) {
+      malformed = true;
+    }
+  }
+
+  if (malformed) return { ok: false, found: false, windows: [], row: -1, lastDatedRow };
+
+  const windows = markers.map((startRow) => {
+    if (!block) return { startRow, endRow: startRow + 1 };
+    let endRow = startRow + 1;
+    while (endRow < values.length && isEmpty(dateCell(values[endRow], dateColumn, columnOnly))) endRow += 1;
+    return { startRow, endRow };
+  });
+  const merged = mergeDateWindows(windows);
+  return {
+    ok: true,
+    found: merged.length > 0,
+    windows: merged,
+    row: merged[0]?.startRow ?? -1,
+    startRow: merged[0]?.startRow ?? -1,
+    endRow: merged[0]?.endRow ?? -1,
+    lastDatedRow
+  };
 }
 
 export function sheetRange(title, row, column) {
